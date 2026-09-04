@@ -112,9 +112,17 @@ pub struct SyncView {
     pub last_exported_mono: Option<String>,
     /// Public commits that are neither our exports nor already reflected (oldest first).
     pub unreflected_pub: Vec<String>,
-    /// `Monosplice-Source` trailers in pub history naming monorepo commits that are not in
-    /// this clone. The mapping cannot be trusted while any exist, so export refuses.
+    /// `Monosplice-Source` trailers naming monorepo commits this clone does not have, found on
+    /// or above the newest public commit whose trailer *does* resolve. Nothing above the
+    /// mapping's newest readable point can be checked, so export refuses while any exist.
     pub broken_source_refs: Vec<BrokenSourceRef>,
+    /// The same, but *behind* the newest resolvable anchor: history, not the mapping.
+    ///
+    /// A rebase on one machine rewrites the sha an earlier export recorded, and every clone made
+    /// afterwards is missing it forever. Once a newer public commit names a commit this clone
+    /// has, that anchor decides what is published and the dead trailers below it can no longer
+    /// change the answer — they are reported and never refused.
+    pub superseded_source_refs: Vec<BrokenSourceRef>,
     /// Do the two repos know about each other at all? False means first contact: the public
     /// branch has history, but nothing on either side references the other, so the only safe
     /// move is `monosplice attach`.
@@ -132,6 +140,7 @@ pub fn unpublished_view(name: &str) -> SyncView {
         last_exported_mono: None,
         unreflected_pub: Vec::new(),
         broken_source_refs: Vec::new(),
+        superseded_source_refs: Vec::new(),
         related: false,
     }
 }
@@ -334,7 +343,13 @@ pub fn load_sync_view(
 
     let missing = missing_objects(root, &exported_mono_order)?;
     let mut broken_source_refs: Vec<BrokenSourceRef> = Vec::new();
+    let mut superseded_source_refs: Vec<BrokenSourceRef> = Vec::new();
 
+    // Newest first, and validation stops at the newest trailer that resolves: that commit is
+    // where the mapping is still readable, and everything below it is already published by
+    // construction. A dead trailer above it (or before any resolve) leaves a stretch of public
+    // history whose provenance cannot be checked at all — that is the broken mapping. A dead
+    // trailer below it is the fossil of a rewrite that a later export already superseded.
     let mut pub_ancestors: HashSet<String> = HashSet::new();
     let mut last_exported_mono: Option<String> = None;
     for pub_sha in &pub_walk {
@@ -344,10 +359,15 @@ pub fn load_sync_view(
         };
         for mono_sha in values {
             if missing.contains(mono_sha) {
-                broken_source_refs.push(BrokenSourceRef {
+                let dead = BrokenSourceRef {
                     pub_sha: pub_sha.clone(),
                     mono_sha: mono_sha.clone(),
-                });
+                };
+                if last_exported_mono.is_some() {
+                    superseded_source_refs.push(dead);
+                } else {
+                    broken_source_refs.push(dead);
+                }
             } else if last_exported_mono.is_none() {
                 last_exported_mono = Some(mono_sha.clone());
             }
@@ -374,6 +394,7 @@ pub fn load_sync_view(
         last_exported_mono,
         unreflected_pub,
         broken_source_refs,
+        superseded_source_refs,
         related,
     })
 }
@@ -700,6 +721,60 @@ mod tests {
         assert_eq!(view.last_exported_mono, None);
         // ...and it still counts as "related": pub is talking about us.
         assert!(view.related);
+        // Nothing resolves anywhere, so nothing supersedes it either.
+        assert!(view.superseded_source_refs.is_empty());
+    }
+
+    /// Validation stops at the newest trailer that resolves. Below that point a dead sha is a
+    /// fossil of somebody's rebase — no clone will ever have it, and it cannot change what is
+    /// published. Above it, the mapping is unreadable and the refusal stands.
+    #[test]
+    fn a_dead_source_ref_is_superseded_below_the_live_anchor_and_broken_above_it() {
+        let f = Fixture::new("superseded-source");
+        let mono = f.sh("git rev-parse HEAD");
+        let tree = f.sh("git rev-parse HEAD:core");
+        let rebased_away = "0".repeat(40);
+        let elsewhere = "1".repeat(40);
+
+        let old = f.push_pub(
+            &tree,
+            None,
+            &format!("export from before a rebase\n\nMonosplice-Source: {rebased_away}\n"),
+        );
+        let live = f.push_pub(
+            &tree,
+            Some(&old),
+            &format!("export that healed it\n\nMonosplice-Source: {mono}\n"),
+        );
+
+        let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
+        assert!(
+            view.broken_source_refs.is_empty(),
+            "{:?}",
+            view.broken_source_refs
+        );
+        assert_eq!(view.superseded_source_refs.len(), 1);
+        assert_eq!(view.superseded_source_refs[0].pub_sha, old);
+        assert_eq!(view.superseded_source_refs[0].mono_sha, rebased_away);
+        assert_eq!(view.last_exported_mono.as_deref(), Some(mono.as_str()));
+        assert_eq!(view.export_base.as_deref(), Some(mono.as_str()));
+
+        // Now a public commit above the live anchor names a commit nobody here has: that
+        // stretch of public history cannot be checked, and the refusal comes back.
+        f.push_pub(
+            &tree,
+            Some(&live),
+            &format!("published from somewhere else\n\nMonosplice-Source: {elsewhere}\n"),
+        );
+        let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
+        assert_eq!(view.broken_source_refs.len(), 1);
+        assert_eq!(view.broken_source_refs[0].mono_sha, elsewhere);
+        assert_eq!(
+            view.superseded_source_refs.len(),
+            1,
+            "still just the fossil"
+        );
+        assert_eq!(view.last_exported_mono.as_deref(), Some(mono.as_str()));
     }
 
     #[test]

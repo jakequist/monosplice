@@ -173,6 +173,10 @@ settles by itself: if the anchor sha is gone but a commit still on your branch p
 exactly the tree the standalone repo already carries, `push` adopts that commit as the anchor,
 prints `recovered anchor: <old> → <new>`, and exports only the work after it — the export was
 correct, only the sha was stale. Anything that actually changed the published tree still stops.
+Clones made *after* someone else's rebase inherit the other half of that story — an old public
+commit naming a sha nobody has any more. Validation stops at the newest anchor that resolves,
+so a dead trailer behind a live one is reported as history and blocks nothing; only a dead
+anchor with nothing readable above it (a shallow clone, the wrong remote) refuses.
 
 **Hooks run before anything leaves.** `exclude` globs filter files out of the export, and
 three per-commit shell hooks — `scan`, `transform`, `rewrite-message` — inspect or rewrite

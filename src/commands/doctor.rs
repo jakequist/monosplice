@@ -383,12 +383,52 @@ fn check_subrepo(
         );
     }
 
+    report_superseded_anchors(&mut section, &view);
+
     if export_base_rewritten(root, &view) {
         report_rewritten_anchor(&mut section, root, subrepo, &view);
     }
 
     verify_mapping(&mut section, root, subrepo, &view);
     Ok((section, Some(view)))
+}
+
+/// Dead `Monosplice-Source` trailers *behind* the newest resolvable anchor. One machine rebased
+/// after an export, so every clone made since is missing the sha that export recorded — and no
+/// clone will ever have it again. It is a fact about history, not a fault to fix: the live
+/// anchor above it decides what is published, so this is a note and `doctor` still exits 0.
+fn report_superseded_anchors(section: &mut Section, view: &SyncView) {
+    if view.superseded_source_refs.is_empty() {
+        return;
+    }
+    let live = view.last_exported_mono.as_deref().unwrap_or("undefined");
+    let oldest_first: Vec<String> = view
+        .superseded_source_refs
+        .iter()
+        .rev()
+        .map(|dead| {
+            format!(
+                "standalone commit {} names {} ({SOURCE_TRAILER}), which this clone does not have.",
+                dead.pub_sha, dead.mono_sha
+            )
+        })
+        .collect();
+    let mut detail: Vec<&str> = oldest_first.iter().map(String::as_str).collect();
+    detail.push(
+        "Monorepo history was rewritten after that export, so the sha it recorded exists nowhere any",
+    );
+    detail.push(
+        "more. A newer standalone commit names a commit this clone has, and that anchor is what push",
+    );
+    detail.push("and pull are measured from; nothing below it can change the answer.");
+    note(
+        section,
+        format!(
+            "informational: {} historical anchor(s) unresolvable — superseded by live anchor at {live}.",
+            view.superseded_source_refs.len()
+        ),
+        &detail,
+    );
 }
 
 /// The anchor sha left HEAD's history. Whether that is a problem depends entirely on content:
