@@ -550,7 +550,10 @@ sync — nothing to push, nothing to pull, no unreachable remote. `status --json
 `doctor --json` print one stable object on stdout and nothing else; diagnostics and warnings
 always go to stderr, so either can be piped straight into `jq`. The JSON keys are camelCase
 (`inSync`, `pullInProgress`, `pushBranch`, `hookError`, `lastExportedMono`) and unchanged from
-the TypeScript releases — a pipeline built on them keeps working.
+the TypeScript releases — a pipeline built on them keeps working. Findings are split the same
+way everywhere: `problems` is what fails the run, `notes` is informational and never changes an
+exit code — including `monorepo.notes`, where settled history (a superseded anchor, an import
+trailer from a remote the subrepo no longer tracks) is reported without failing anything.
 
 ```sh
 monosplice status --check              # 0 = converged, 1 = drift

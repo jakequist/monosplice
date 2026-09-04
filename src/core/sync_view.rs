@@ -100,6 +100,10 @@ pub struct SyncView {
     pub exported_mono_to_pub: HashMap<String, String>,
     /// Public shas already imported into the monorepo, from `Monosplice-Origin` trailers on HEAD.
     pub imported_pub_shas: HashSet<String>,
+    /// The same trailers, still attached to the monorepo commit that carries each one — the
+    /// flattening of this is [`SyncView::imported_pub_shas`]. Provenance is only judgeable in
+    /// place: whether an unresolvable import sha matters depends on where in history it sits.
+    pub origin_by_mono: HashMap<String, Vec<String>>,
     /// Where the export scan starts: the newest commit on the HEAD walk that is either already
     /// exported (`Monosplice-Source` names it) or anchors the monorepo to the public branch
     /// (`Monosplice-Origin` naming pub head or one of its ancestors). Export scans
@@ -136,6 +140,7 @@ pub fn unpublished_view(name: &str) -> SyncView {
         pub_head: None,
         exported_mono_to_pub: HashMap::new(),
         imported_pub_shas: HashSet::new(),
+        origin_by_mono: HashMap::new(),
         export_base: None,
         last_exported_mono: None,
         unreflected_pub: Vec::new(),
@@ -313,6 +318,7 @@ pub fn load_sync_view(
         }
         return Ok(SyncView {
             imported_pub_shas,
+            origin_by_mono,
             ..unpublished_view(&s.name)
         });
     };
@@ -390,6 +396,7 @@ pub fn load_sync_view(
         pub_head: Some(pub_head),
         exported_mono_to_pub,
         imported_pub_shas,
+        origin_by_mono,
         export_base,
         last_exported_mono,
         unreflected_pub,

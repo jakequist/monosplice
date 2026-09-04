@@ -5,17 +5,17 @@
 //! in for "does not apply here", and `problems`/`notes` carrying only the headline of each
 //! finding — the detail lines are advice for a terminal, not data.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::Serialize;
 
 use crate::config::ResolvedSubrepo;
 use crate::core::exporter::{
-    compute_exports, export_base_rewritten, find_anchor_recovery, plan_export,
+    compute_exports, export_base_rewritten, find_anchor_recovery, live_export_anchor, plan_export,
 };
 use crate::core::filter::filtered_subtree;
-use crate::core::git::{git, rev_list};
+use crate::core::git::{git, git_ok, rev_list};
 use crate::core::importer::{read_sequencer, sequencer_path};
 use crate::core::sync_view::{
     is_triangular, load_sync_view, pull_source, try_load_fork_state, SyncView, SyncViewOptions,
@@ -77,6 +77,9 @@ struct PullInProgress {
 #[derive(Debug, Serialize)]
 struct MonorepoFindings {
     problems: Vec<String>,
+    /// Findings that do not fail the run: unresolvable import provenance a live anchor has
+    /// already settled.
+    notes: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -119,28 +122,56 @@ pub fn run(args: &DoctorArgs) -> Result<(), Failure> {
     let mut sections: Vec<Section> = Vec::new();
     let mut fetched_pub_shas: HashSet<String> = HashSet::new();
     let mut imported_pub_shas: HashSet<String> = HashSet::new();
+    let mut origin_by_mono: HashMap<String, Vec<String>> = HashMap::new();
+    let mut live_anchors: Vec<String> = Vec::new();
+    let mut every_subrepo_anchored = true;
 
     for subrepo in &subrepos {
-        let (section, view) = check_subrepo(&root, subrepo)?;
+        let (section, checked) = check_subrepo(&root, subrepo)?;
         sections.push(section);
-        if let Some(view) = view {
-            for sha in rev_list(&root, &[&view.tracking_ref])
-                .map_err(|err| Failure::error(err.to_string()))?
-            {
-                fetched_pub_shas.insert(sha);
-            }
-            // Every view derives this from the same HEAD walk, so the last one wins and they
-            // are all equal — the TypeScript did exactly this, for exactly that reason.
-            imported_pub_shas = view.imported_pub_shas;
+        let Some(checked) = checked else {
+            every_subrepo_anchored = false;
+            continue;
+        };
+        for sha in rev_list(&root, &[&checked.view.tracking_ref])
+            .map_err(|err| Failure::error(err.to_string()))?
+        {
+            fetched_pub_shas.insert(sha);
+        }
+        // Every view derives these from the same HEAD walk, so the last one wins and they
+        // are all equal — the TypeScript did exactly this, for exactly that reason.
+        imported_pub_shas = checked.view.imported_pub_shas;
+        origin_by_mono = checked.view.origin_by_mono;
+        match checked.live_anchor {
+            Some(anchor) => live_anchors.push(anchor),
+            None => every_subrepo_anchored = false,
         }
     }
 
+    // A live anchor proves *its* subrepo agrees with *its* remote at that commit — it says
+    // nothing about another subrepo's remote. An import trailer cannot be attributed to a
+    // subrepo once its sha resolves nowhere, so a fossil counts as settled only when every
+    // configured subrepo has a live anchor and the commit carrying it is below all of them.
+    let settled = |mono_sha: &str| {
+        every_subrepo_anchored
+            && !live_anchors.is_empty()
+            && live_anchors
+                .iter()
+                .all(|anchor| git_ok(&root, &["merge-base", "--is-ancestor", mono_sha, anchor]))
+    };
+
     // Only meaningful with every subrepo in view: a Monosplice-Origin trailer in monorepo
     // history may belong to any of the configured remotes.
-    let orphans = if args.subrepo.is_some() {
-        Vec::new()
+    let (orphans, fossils) = if args.subrepo.is_some() {
+        (Vec::new(), Vec::new())
     } else {
-        check_origins(&imported_pub_shas, &fetched_pub_shas)
+        classify_origins(
+            &imported_pub_shas,
+            &fetched_pub_shas,
+            &origin_by_mono,
+            oldest_anchor(&root, &live_anchors),
+            settled,
+        )
     };
 
     let problems = usize::from(pull_in_progress.is_some())
@@ -154,6 +185,7 @@ pub fn run(args: &DoctorArgs) -> Result<(), Failure> {
         subrepos: sections.iter().map(|s| s.row.clone()).collect(),
         monorepo: MonorepoFindings {
             problems: orphans.iter().map(|f| f.headline.clone()).collect(),
+            notes: fossils.iter().map(|f| f.headline.clone()).collect(),
         },
     };
 
@@ -161,7 +193,7 @@ pub fn run(args: &DoctorArgs) -> Result<(), Failure> {
         let json = serde_json::to_string(&report).map_err(|err| Failure::error(err.to_string()))?;
         println!("{json}");
     } else {
-        render(&report, &sections, &orphans);
+        render(&report, &sections, &orphans, &fossils);
     }
 
     if problems == 0 {
@@ -176,7 +208,7 @@ pub fn run(args: &DoctorArgs) -> Result<(), Failure> {
 // Human rendering. Everything above builds the model; this is the only place that prints.
 // ---------------------------------------------------------------------------------------
 
-fn render(report: &DoctorReport, sections: &[Section], orphans: &[Finding]) {
+fn render(report: &DoctorReport, sections: &[Section], orphans: &[Finding], fossils: &[Finding]) {
     if let Some(pull) = &report.pull_in_progress {
         println!(
             "✗ an unfinished pull of {} is recorded in {}",
@@ -194,10 +226,15 @@ fn render(report: &DoctorReport, sections: &[Section], orphans: &[Finding]) {
         }
         println!();
     }
-    if !orphans.is_empty() {
+    if !orphans.is_empty() || !fossils.is_empty() {
         println!("monorepo");
         for finding in orphans {
             for line in render_finding("✗", finding) {
+                println!("{line}");
+            }
+        }
+        for finding in fossils {
+            for line in render_finding("!", finding) {
                 println!("{line}");
             }
         }
@@ -239,10 +276,17 @@ fn note(section: &mut Section, headline: String, detail: &[&str]) {
     section.lines.extend(render_finding("!", &finding));
 }
 
+/// What one subrepo contributed to the monorepo-wide checks: the view it derived, and the
+/// commit that currently vouches for everything below it (`None` when nothing does).
+struct Checked {
+    view: SyncView,
+    live_anchor: Option<String>,
+}
+
 fn check_subrepo(
     root: &Path,
     subrepo: &ResolvedSubrepo,
-) -> Result<(Section, Option<SyncView>), Failure> {
+) -> Result<(Section, Option<Checked>), Failure> {
     let triangular = is_triangular(subrepo);
     let mut section = Section {
         row: DoctorSubrepo {
@@ -390,7 +434,8 @@ fn check_subrepo(
     }
 
     verify_mapping(&mut section, root, subrepo, &view);
-    Ok((section, Some(view)))
+    let live_anchor = live_export_anchor(root, subrepo, &view);
+    Ok((section, Some(Checked { view, live_anchor })))
 }
 
 /// Dead `Monosplice-Source` trailers *behind* the newest resolvable anchor. One machine rebased
@@ -589,21 +634,60 @@ fn verify_mapping(section: &mut Section, root: &Path, subrepo: &ResolvedSubrepo,
     );
 }
 
-/// A `Monosplice-Origin` trailer naming a commit no configured remote has. Sorted: the
-/// TypeScript walked a `Set` in insertion order, which a Rust `HashSet` cannot reproduce, so
-/// the report picks the one ordering that is stable run to run.
-fn check_origins(
+/// The oldest of the live anchors, which is the one every settled fossil sits below and so the
+/// weakest — therefore the honest — claim the note can make. Ancestry in one repository is a
+/// total order along a line of history; anything it cannot compare keeps the first anchor.
+fn oldest_anchor(root: &Path, live_anchors: &[String]) -> Option<String> {
+    let mut oldest = live_anchors.first()?.clone();
+    for anchor in live_anchors.iter().skip(1) {
+        if git_ok(root, &["merge-base", "--is-ancestor", anchor, &oldest]) {
+            oldest = anchor.clone();
+        }
+    }
+    Some(oldest)
+}
+
+/// `Monosplice-Origin` trailers naming commits no configured remote has, split by *where* they
+/// sit: problems, then settled fossils.
+///
+/// Re-baselining a subrepo onto a freshly created repository leaves every clone's history
+/// claiming imports from the repository it used to track — shas the new remote never had and
+/// never will. Below a live export anchor that is settled: the anchor proves the monorepo and
+/// the current remote already agree on a state, so provenance underneath it cannot change what
+/// push or pull do. Above it — or with nothing anchored at all, which is what pointing at the
+/// wrong remote looks like — the claim is still unexplained and still fails the run.
+///
+/// `settled` decides that placement; it is injected so the rule stays testable without a repo.
+/// A fossil no commit on the HEAD walk carries can never be settled: there is nothing to place.
+///
+/// Sorted: the TypeScript walked a `Set` in insertion order, which a Rust `HashSet` cannot
+/// reproduce, so the report picks the one ordering that is stable run to run.
+fn classify_origins(
     imported_pub_shas: &HashSet<String>,
     fetched_pub_shas: &HashSet<String>,
-) -> Vec<Finding> {
+    origin_by_mono: &HashMap<String, Vec<String>>,
+    live_anchor: Option<String>,
+    settled: impl Fn(&str) -> bool,
+) -> (Vec<Finding>, Vec<Finding>) {
     let mut orphans: Vec<&String> = imported_pub_shas
         .iter()
         .filter(|sha| !fetched_pub_shas.contains(*sha))
         .collect();
     orphans.sort();
-    orphans
-        .into_iter()
-        .map(|sha| Finding {
+
+    let mut problems: Vec<Finding> = Vec::new();
+    let mut fossils: Vec<String> = Vec::new();
+    for sha in orphans {
+        let carriers: Vec<&String> = origin_by_mono
+            .iter()
+            .filter(|(_, values)| values.contains(sha))
+            .map(|(mono_sha, _)| mono_sha)
+            .collect();
+        if !carriers.is_empty() && carriers.iter().all(|mono_sha| settled(mono_sha)) {
+            fossils.push(sha.clone());
+            continue;
+        }
+        problems.push(Finding {
             headline: format!(
                 "monorepo history claims to have imported commit {sha} ({ORIGIN_TRAILER}), but no configured remote has it."
             ),
@@ -611,8 +695,39 @@ fn check_origins(
                 "The standalone branch was probably rewritten (force-push) after that import, or the commit came".to_string(),
                 "from a subrepo that is no longer in your config.".to_string(),
             ],
-        })
-        .collect()
+        });
+    }
+
+    let notes = if fossils.is_empty() {
+        Vec::new()
+    } else {
+        let live = live_anchor.unwrap_or_else(|| "undefined".to_string());
+        let mut detail: Vec<String> = fossils
+            .iter()
+            .map(|sha| format!("imported commit {sha} ({ORIGIN_TRAILER}) resolves nowhere."))
+            .collect();
+        detail.push(
+            "Those imports came from a repository this subrepo no longer tracks — a re-baseline onto a new"
+                .to_string(),
+        );
+        detail.push(
+            "remote, or a standalone branch rewritten since. The live anchor above them proves the monorepo and"
+                .to_string(),
+        );
+        detail.push(
+            "the current remote agree, so nothing below it can change what push or pull do."
+                .to_string(),
+        );
+        vec![Finding {
+            headline: format!(
+                "informational: {} historical import trailer(s) unresolvable — superseded by live anchor at {live}.",
+                fossils.len()
+            ),
+            detail,
+        }]
+    };
+
+    (problems, notes)
 }
 
 #[cfg(test)]
@@ -697,12 +812,13 @@ mod tests {
             subrepos: vec![row()],
             monorepo: MonorepoFindings {
                 problems: vec!["orphan".to_string()],
+                notes: Vec::new(),
             },
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.starts_with("{\"ok\":false,\"problems\":1,\"pullInProgress\":{\"subrepo\":\"core\",\"statePath\":\"/repo/.git/monosplice/pull-state.json\"},\"subrepos\":[{"), "{json}");
         assert!(
-            json.ends_with("],\"monorepo\":{\"problems\":[\"orphan\"]}}"),
+            json.ends_with("],\"monorepo\":{\"problems\":[\"orphan\"],\"notes\":[]}}"),
             "{json}"
         );
     }
@@ -716,11 +832,12 @@ mod tests {
             subrepos: Vec::new(),
             monorepo: MonorepoFindings {
                 problems: Vec::new(),
+                notes: Vec::new(),
             },
         };
         assert_eq!(
             serde_json::to_string(&report).unwrap(),
-            "{\"ok\":true,\"problems\":0,\"pullInProgress\":null,\"subrepos\":[],\"monorepo\":{\"problems\":[]}}"
+            "{\"ok\":true,\"problems\":0,\"pullInProgress\":null,\"subrepos\":[],\"monorepo\":{\"problems\":[],\"notes\":[]}}"
         );
     }
 
@@ -737,17 +854,88 @@ mod tests {
         assert_eq!(render_finding("!", &finding)[0], "  ! it broke");
     }
 
+    fn imports(pairs: &[(&str, &str)]) -> HashMap<String, Vec<String>> {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for (mono_sha, pub_sha) in pairs {
+            map.entry((*mono_sha).to_string())
+                .or_default()
+                .push((*pub_sha).to_string());
+        }
+        map
+    }
+
     #[test]
     fn an_origin_no_remote_has_is_an_orphan_and_a_fetched_one_is_not() {
         let imported: HashSet<String> =
             ["bbb".to_string(), "aaa".to_string()].into_iter().collect();
         let fetched: HashSet<String> = ["bbb".to_string()].into_iter().collect();
-        let orphans = check_origins(&imported, &fetched);
-        assert_eq!(orphans.len(), 1);
+        let carriers = imports(&[("mono1", "aaa"), ("mono2", "bbb")]);
+        // Nothing is anchored, so nothing is settled: today's behaviour, unchanged.
+        let (problems, notes) = classify_origins(&imported, &fetched, &carriers, None, |_| false);
+        assert_eq!(problems.len(), 1);
         assert_eq!(
-            orphans[0].headline,
+            problems[0].headline,
             "monorepo history claims to have imported commit aaa (Monosplice-Origin), but no configured remote has it."
         );
-        assert!(check_origins(&fetched, &fetched).is_empty());
+        assert!(notes.is_empty());
+
+        let (problems, notes) = classify_origins(
+            &fetched,
+            &fetched,
+            &carriers,
+            Some("anchor".to_string()),
+            |_| true,
+        );
+        assert!(
+            problems.is_empty() && notes.is_empty(),
+            "nothing is orphaned"
+        );
+    }
+
+    /// The re-baseline rule: below a live anchor an unresolvable import is history, above it
+    /// the claim is still unexplained. Placement is the whole decision.
+    #[test]
+    fn an_orphan_below_the_live_anchor_is_a_note_and_one_above_it_is_a_problem() {
+        let imported: HashSet<String> = ["old".to_string(), "newer".to_string()]
+            .into_iter()
+            .collect();
+        let fetched: HashSet<String> = HashSet::new();
+        let carriers = imports(&[("below", "old"), ("above", "newer")]);
+
+        let (problems, notes) = classify_origins(
+            &imported,
+            &fetched,
+            &carriers,
+            Some("anchor".to_string()),
+            |mono_sha| mono_sha == "below",
+        );
+        assert_eq!(problems.len(), 1);
+        assert!(
+            problems[0].headline.contains("imported commit newer"),
+            "{}",
+            problems[0].headline
+        );
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            notes[0].headline,
+            "informational: 1 historical import trailer(s) unresolvable — superseded by live anchor at anchor."
+        );
+        assert!(notes[0].detail[0].contains("imported commit old"));
+    }
+
+    /// A sha no commit on the HEAD walk carries cannot be placed, so it can never be settled —
+    /// otherwise "below every anchor" would be vacuously true and excuse an unattributable claim.
+    #[test]
+    fn an_orphan_nothing_carries_is_never_settled() {
+        let imported: HashSet<String> = ["ghost".to_string()].into_iter().collect();
+        let (problems, notes) = classify_origins(
+            &imported,
+            &HashSet::new(),
+            &HashMap::new(),
+            Some("anchor".to_string()),
+            |_| true,
+        );
+        assert_eq!(problems.len(), 1);
+        assert!(notes.is_empty());
     }
 }

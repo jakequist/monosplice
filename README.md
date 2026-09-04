@@ -176,7 +176,9 @@ correct, only the sha was stale. Anything that actually changed the published tr
 Clones made *after* someone else's rebase inherit the other half of that story — an old public
 commit naming a sha nobody has any more. Validation stops at the newest anchor that resolves,
 so a dead trailer behind a live one is reported as history and blocks nothing; only a dead
-anchor with nothing readable above it (a shallow clone, the wrong remote) refuses.
+anchor with nothing readable above it (a shallow clone, the wrong remote) refuses. The same
+rule runs in the import direction: re-baseline a subrepo onto a brand-new repository and the old
+`Monosplice-Origin` trailers below the live anchor become history too — reported, never fatal.
 
 **Hooks run before anything leaves.** `exclude` globs filter files out of the export, and
 three per-commit shell hooks — `scan`, `transform`, `rewrite-message` — inspect or rewrite

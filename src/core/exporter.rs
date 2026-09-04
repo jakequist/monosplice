@@ -397,6 +397,29 @@ pub fn find_anchor_recovery(
     }))
 }
 
+/// The monorepo commit that currently proves the two repositories agree on a state: the newest
+/// `Monosplice-Source` the public branch records that this clone has *and* that HEAD descends
+/// from, or — when a rewrite moved it — the commit that publishes the same tree today.
+///
+/// It is the one fact that settles history below it. Everything up to a live anchor is
+/// published by construction, whatever the trailers down there happen to say, which is what lets
+/// `doctor` tell a fossil from a broken mapping. `None` means nothing vouches for anything:
+/// never published, the wrong remote, or a mapping that cannot be read.
+pub fn live_export_anchor(
+    root: &Path,
+    subrepo: &ResolvedSubrepo,
+    view: &SyncView,
+) -> Option<String> {
+    let last = view.last_exported_mono.clone()?;
+    if git_ok(root, &["merge-base", "--is-ancestor", &last, "HEAD"]) {
+        return Some(last);
+    }
+    find_anchor_recovery(root, subrepo, view)
+        .ok()
+        .flatten()
+        .map(|recovery| recovery.recovered)
+}
+
 /// Adopt a recovered anchor into the view, so the export range is derived from it. Returns
 /// `None` when the anchor is intact or nothing on the HEAD walk reproduces the published tree —
 /// in which case [`check_export_preconditions`] still refuses, exactly as before.
