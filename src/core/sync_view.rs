@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::config::ResolvedSubrepo;
-use crate::core::filter::filtered_subtree;
+use crate::core::filter::anchor_subtree;
 use crate::core::git::{
     existing_commits, fetch_branch, git, git_with, ls_remote_branch, missing_objects, rev_list,
     rev_parse, trailer_values, GitError, GitOpts,
@@ -173,20 +173,13 @@ pub fn try_load_fork_state(
 /// the config excludes do not — they carry work the public branch has never seen, so they
 /// cannot be an export boundary.
 ///
-/// The `scan` hook is deliberately dropped for this comparison: it inspects a tree, it never
-/// shapes one, so whether the content passes a secret scan says nothing about whether it
-/// reproduces `pub_sha`. Running it here would let a scan that rejects already-published
-/// content (a legacy secret, a hook tightened after the attach) veto anchor detection — and a
-/// vetoed anchor collapses `export_base` to "scan all of HEAD", which re-exports every
-/// ancestor of the anchor. `transform` still runs, because it *does* shape the tree; if it
-/// cannot, the commit genuinely is not a boundary and `push` reports the failure on its own
-/// terms.
+/// The comparison runs through [`anchor_subtree`], so the `scan` hook is dropped: a scan that
+/// rejects already-published content (a legacy secret, a hook tightened after the attach) must
+/// not veto anchor detection — a vetoed anchor collapses `export_base` to "scan all of HEAD",
+/// which re-exports every ancestor of the anchor. If a `transform` cannot run, the commit
+/// genuinely is not a boundary and `push` reports the failure on its own terms.
 fn reflects_exactly(root: &Path, s: &ResolvedSubrepo, mono_sha: &str, pub_sha: &str) -> bool {
-    let for_anchor = ResolvedSubrepo {
-        scan: None,
-        ..s.clone()
-    };
-    let Ok(Some(mono_tree)) = filtered_subtree(root, mono_sha, &for_anchor) else {
+    let Ok(Some(mono_tree)) = anchor_subtree(root, mono_sha, s) else {
         return false;
     };
     match git(root, &["rev-parse", &format!("{pub_sha}^{{tree}}")]) {

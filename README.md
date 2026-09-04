@@ -168,7 +168,11 @@ commit counts as synced when the sync point descends from it — which is why at
 200-commit repo with a single snapshot commit reports "in sync", not "200 to pull". A fresh
 clone on a new machine can push, pull and sync immediately: no cache to invalidate, no
 lockfile to conflict on. And when the picture doesn't add up (shallow clone, rewritten
-history), monosplice stops and says so rather than guessing.
+history), monosplice stops and says so rather than guessing. A rebase is the one rewrite it
+settles by itself: if the anchor sha is gone but a commit still on your branch publishes
+exactly the tree the standalone repo already carries, `push` adopts that commit as the anchor,
+prints `recovered anchor: <old> → <new>`, and exports only the work after it — the export was
+correct, only the sha was stale. Anything that actually changed the published tree still stops.
 
 **Hooks run before anything leaves.** `exclude` globs filter files out of the export, and
 three per-commit shell hooks — `scan`, `transform`, `rewrite-message` — inspect or rewrite

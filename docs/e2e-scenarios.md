@@ -64,6 +64,7 @@ subrepo, `core/` = the configured subrepo path.
 - [x] S52 Broken mapping (pub trailer referencing a mono sha that doesn't exist locally) → `doctor` detects and reports it clearly.
 - [x] S53 Fresh clone of mono in a new directory ("second machine") → `status`/`push`/`pull` work immediately with no state to restore.
 - [x] S54 Mono main was rebased/force-pushed (cursor no longer an ancestor of HEAD) → loud error naming the problem; nothing exported.
+- [x] S55 Mono main was rebased over unrelated commits — the anchor sha is gone but the subrepo tree is byte-identical → `push` re-derives the anchor from that tree (`recovered anchor: <old> → <new>`), exports only the new commit, and is ordinary again afterwards; `doctor` reports the recovery it would do as a note; a rewrite that changed the subrepo tree still refuses, and unimported standalone commits still refuse.
 
 ## Multi-subrepo
 

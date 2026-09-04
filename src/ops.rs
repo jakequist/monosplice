@@ -13,8 +13,8 @@ use std::path::Path;
 
 use crate::config::ResolvedSubrepo;
 use crate::core::exporter::{
-    check_export_preconditions, plan_export, publish_baseline, publish_full_history, run_export,
-    ExportError,
+    check_export_preconditions, plan_export, publish_baseline, publish_full_history,
+    recover_export_anchor, run_export, ExportError,
 };
 use crate::core::filter::{has_committed_files, FilterError};
 use crate::core::git::{commit_subjects, rev_list, rev_parse, GitError};
@@ -282,13 +282,29 @@ pub struct ExportSummary {
     pub awaiting: usize,
 }
 
+/// Re-derive an anchor that a history rewrite moved, and say so. A rebase that left the
+/// subrepo tree byte-identical published exactly the right content under a sha that no longer
+/// exists; adopting the commit that carries that tree today is bookkeeping, not a new decision,
+/// so it is a notice rather than a question. When nothing matches, the view is untouched and
+/// the caller's precondition check refuses exactly as it always did.
+fn recover_anchor(
+    root: &Path,
+    subrepo: &ResolvedSubrepo,
+    view: &mut SyncView,
+) -> Result<(), SubrepoFailure> {
+    if let Some(recovery) = recover_export_anchor(root, subrepo, view).map_err(raw_failure)? {
+        warn(&recovery.message(&subrepo.name));
+    }
+    Ok(())
+}
+
 /// Export every pending monorepo commit.
 pub fn export_subrepo(
     root: &Path,
     subrepo: &ResolvedSubrepo,
     loaded: Option<SyncView>,
 ) -> Result<ExportSummary, SubrepoFailure> {
-    let view = match loaded {
+    let mut view = match loaded {
         Some(view) => view,
         None => load_view(root, subrepo, SyncViewOptions::default())?,
     };
@@ -299,6 +315,8 @@ pub fn export_subrepo(
             &format!("Nothing was pushed to {}.", subrepo.remote),
         )));
     }
+
+    recover_anchor(root, subrepo, &mut view)?;
 
     if let Some(unsafe_state) = check_export_preconditions(root, subrepo, &view) {
         return Err(SubrepoFailure::new(unsafe_state));
@@ -417,7 +435,7 @@ pub fn plan_push_dry_run(
     subrepo: &ResolvedSubrepo,
     export_history: bool,
 ) -> Result<DryRunPlan, SubrepoFailure> {
-    let view = load_view(root, subrepo, SyncViewOptions::default())?;
+    let mut view = load_view(root, subrepo, SyncViewOptions::default())?;
 
     if view.pub_head.is_none() {
         if subrepo.upstream.is_some() {
@@ -449,6 +467,10 @@ pub fn plan_push_dry_run(
             &format!("Nothing was pushed to {}.", subrepo.remote),
         )));
     }
+
+    // The preview has to see what the push will see, anchor recovery included, or a dry run
+    // would refuse where the real command succeeds.
+    recover_anchor(root, subrepo, &mut view)?;
 
     if let Some(unsafe_state) = check_export_preconditions(root, subrepo, &view) {
         return Err(SubrepoFailure::new(unsafe_state));

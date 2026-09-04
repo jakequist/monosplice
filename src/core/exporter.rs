@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use crate::config::ResolvedSubrepo;
-use crate::core::filter::{filtered_subtree, FilterError};
+use crate::core::filter::{anchor_subtree, filtered_subtree, FilterError};
 use crate::core::git::{
     commit_tree, git, git_ok, push_ref, push_ref_with_lease, read_commit, rev_list, CommitMeta,
     CommitTreeInput, GitError, EMPTY_TREE,
@@ -306,7 +306,133 @@ pub fn export_base_rewritten(root: &Path, view: &SyncView) -> bool {
     !git_ok(root, &["merge-base", "--is-ancestor", last, "HEAD"])
 }
 
-/// Why export must not run, or `None` when the derived mapping is trustworthy.
+/// How far back a content-anchored recovery looks. A rewrite that moved the anchor further
+/// than this is not the "rebased over unrelated commits" case this recovers, and an unbounded
+/// walk would turn one stale sha into a scan of the whole monorepo.
+pub const ANCHOR_RECOVERY_LIMIT: usize = 1000;
+
+/// A stale anchor that content proves is *only* stale.
+///
+/// The anchor is recorded as a sha, but what it stands for is a tree: "the standalone repo
+/// already carries everything this commit publishes". A rebase over commits that touched other
+/// paths rewrites the sha and keeps the tree, so the recorded commit leaves HEAD's history
+/// while the export it names stays correct. Re-deriving the sha from the tree is not a
+/// weakening of the rewrite check — it is the same check, asked about the thing that matters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorRecovery {
+    /// The sha pub records, no longer reachable from HEAD.
+    pub missing: String,
+    /// The commit adopted in its place: the newest one on the HEAD walk publishing that tree.
+    pub recovered: String,
+    /// The public commit whose tree both of them export.
+    pub pub_sha: String,
+    /// How many further commits directly below `recovered` publish the same tree. Identical
+    /// trees mean identical exports, so which one is chosen cannot change what gets pushed —
+    /// but the report says that the newest was taken.
+    pub also_matching: usize,
+}
+
+impl AnchorRecovery {
+    /// The one line a `push` prints about it.
+    pub fn message(&self, subrepo: &str) -> String {
+        let mut out = format!(
+            "{subrepo}: recovered anchor: {} → {} (identical subrepo tree after history rewrite)",
+            self.missing, self.recovered
+        );
+        if self.also_matching > 0 {
+            out.push_str(&format!(
+                " — newest of {} adjacent commits publishing that tree",
+                self.also_matching + 1
+            ));
+        }
+        out
+    }
+}
+
+/// Look for a commit on HEAD's history that publishes exactly what the missing anchor
+/// published. Read-only: `doctor` calls this to report the recovery `push` would do.
+///
+/// Comparison goes through [`anchor_subtree`], the same tree mapping the exporter publishes
+/// with (excludes, `transform`) minus the `scan` hook, which judges content rather than
+/// shaping it. First-parent, newest first, bounded by [`ANCHOR_RECOVERY_LIMIT`]: the first
+/// match is the newest, and stopping there is what keeps the range as tight as the original.
+///
+/// A commit whose subtree cannot be resolved (a `transform` that fails on old content) is not a
+/// match rather than an error: recovery must never invent a new way for `push` to fail.
+pub fn find_anchor_recovery(
+    root: &Path,
+    subrepo: &ResolvedSubrepo,
+    view: &SyncView,
+) -> Result<Option<AnchorRecovery>, ExportError> {
+    if !export_base_rewritten(root, view) {
+        return Ok(None);
+    }
+    let Some(missing) = view.last_exported_mono.clone() else {
+        return Ok(None);
+    };
+    let Some(pub_sha) = view.exported_mono_to_pub.get(&missing).cloned() else {
+        return Ok(None);
+    };
+    let target = git(root, &["rev-parse", &format!("{pub_sha}^{{tree}}")])?;
+
+    let limit = ANCHOR_RECOVERY_LIMIT.to_string();
+    let mut recovered: Option<String> = None;
+    let mut also_matching = 0usize;
+    for sha in rev_list(root, &["--first-parent", "-n", &limit, "HEAD"])? {
+        let tree = anchor_subtree(root, &sha, subrepo).ok().flatten();
+        let matches = tree.as_deref() == Some(target.as_str());
+        match (&recovered, matches) {
+            (None, true) => recovered = Some(sha),
+            (Some(_), true) => also_matching += 1,
+            (Some(_), false) => break,
+            (None, false) => {}
+        }
+    }
+
+    Ok(recovered.map(|recovered| AnchorRecovery {
+        missing,
+        recovered,
+        pub_sha,
+        also_matching,
+    }))
+}
+
+/// Adopt a recovered anchor into the view, so the export range is derived from it. Returns
+/// `None` when the anchor is intact or nothing on the HEAD walk reproduces the published tree —
+/// in which case [`check_export_preconditions`] still refuses, exactly as before.
+///
+/// Only the anchor moves. Divergence (unimported public commits) is decided elsewhere, from
+/// data this does not touch.
+pub fn recover_export_anchor(
+    root: &Path,
+    subrepo: &ResolvedSubrepo,
+    view: &mut SyncView,
+) -> Result<Option<AnchorRecovery>, ExportError> {
+    let Some(recovery) = find_anchor_recovery(root, subrepo, view)? else {
+        return Ok(None);
+    };
+    // The scan base only ever moves forward: a surviving anchor newer than the recovered one
+    // already proves pub carries everything up to it, and widening the range would replay
+    // commits pub has.
+    let keep_base = match &view.export_base {
+        Some(base) => git_ok(
+            root,
+            &["merge-base", "--is-ancestor", &recovery.recovered, base],
+        ),
+        None => false,
+    };
+    if !keep_base {
+        view.export_base = Some(recovery.recovered.clone());
+    }
+    view.last_exported_mono = Some(recovery.recovered.clone());
+    view.exported_mono_to_pub
+        .insert(recovery.recovered.clone(), recovery.pub_sha.clone());
+    Ok(Some(recovery))
+}
+
+/// Why export must not run, or `None` when the derived mapping is trustworthy. Callers run
+/// [`recover_export_anchor`] first: a stale anchor that content can re-derive is not a reason
+/// to stop, and this refuses only what is left.
 pub fn check_export_preconditions(
     root: &Path,
     subrepo: &ResolvedSubrepo,
@@ -779,12 +905,22 @@ mod tests {
         let view = f.view(&s);
         assert!(!export_base_rewritten(f.root(), &view));
         assert_eq!(check_export_preconditions(f.root(), &s, &view), None);
+        assert_eq!(
+            find_anchor_recovery(f.root(), &s, &view).expect("probe"),
+            None,
+            "an intact anchor is never 'recovered'"
+        );
 
         let last = view.last_exported_mono.clone().expect("a last export");
         f.sh("git reset -q --hard HEAD~1");
         let view = f.view(&s);
         assert_eq!(view.last_exported_mono.as_deref(), Some(last.as_str()));
         assert!(export_base_rewritten(f.root(), &view));
+        assert_eq!(
+            find_anchor_recovery(f.root(), &s, &view).expect("probe"),
+            None,
+            "nothing on the HEAD walk publishes the exported tree any more"
+        );
         let message = check_export_preconditions(f.root(), &s, &view).expect("a refusal");
         assert_eq!(
             message,
@@ -792,6 +928,88 @@ mod tests {
                 "core: the last exported monorepo commit {last} is no longer an ancestor of HEAD.\nMonorepo history was rewritten (rebase, amend or force-push) underneath it, so monosplice cannot tell which commits are new. Nothing was pushed to {}.\nRun `monosplice doctor` for details, then restore that commit (`git reflog`) before pushing again.",
                 f.remote_url()
             )
+        );
+    }
+
+    /// The production case: history was rewritten *above* the anchor without touching what the
+    /// anchor publishes, so the sha is stale and the export it named is still correct.
+    #[test]
+    fn a_rewrite_that_keeps_the_subrepo_tree_recovers_the_anchor_and_prefers_the_newest() {
+        let f = Fixture::new("anchor-recovery");
+        let s = f.subrepo();
+        let root_commit = f.sh("git rev-parse HEAD");
+
+        // The ordinary first export of the root commit.
+        let view = f.view(&s);
+        let candidates = plan_export(f.root(), &s, &view).expect("plan");
+        run_export(f.root(), &s, &view, &candidates).expect("export");
+        let pub_head = f.sh("git rev-parse refs/monosplice/core/remote");
+
+        // A second export, from a commit that changes nothing under core/ and then leaves the
+        // main line — the rebased-away sha. Pub still records it.
+        f.sh("git checkout -q -b rewritten-away");
+        f.sh("printf 'moved on\n' > top.txt");
+        let away = f.commit("work outside core");
+        let tree = f.sh("git rev-parse HEAD:core");
+        let p1 = f.sh(&format!(
+            "printf 'export\n\nMonosplice-Source: {away}\n' | git commit-tree {tree} -p {pub_head}"
+        ));
+        f.sh(&format!(
+            "git push -q {} {p1}:refs/heads/main",
+            f.remote_url()
+        ));
+
+        // Back on main: two more commits, each publishing that same core tree.
+        f.sh("git checkout -q main");
+        let b = f.commit("nothing to do with core");
+        let c = f.commit("also nothing to do with core");
+
+        let mut view = f.view(&s);
+        assert_eq!(view.last_exported_mono.as_deref(), Some(away.as_str()));
+        assert!(export_base_rewritten(f.root(), &view));
+
+        let recovery = find_anchor_recovery(f.root(), &s, &view)
+            .expect("probe")
+            .expect("the tree is still on the walk");
+        assert_eq!(recovery.missing, away);
+        assert_eq!(recovery.recovered, c, "the newest match wins");
+        assert_eq!(recovery.pub_sha, p1);
+        assert_eq!(
+            recovery.also_matching, 2,
+            "{b} and {root_commit} publish it too"
+        );
+        let line = recovery.message("core");
+        assert_eq!(
+            line,
+            format!("core: recovered anchor: {away} → {c} (identical subrepo tree after history rewrite) — newest of 3 adjacent commits publishing that tree")
+        );
+
+        // Adopting it clears the refusal and tightens the range to "after the anchor".
+        let applied = recover_export_anchor(f.root(), &s, &mut view)
+            .expect("recover")
+            .expect("recovered");
+        assert_eq!(applied, recovery);
+        assert_eq!(view.export_base.as_deref(), Some(c.as_str()));
+        assert_eq!(view.last_exported_mono.as_deref(), Some(c.as_str()));
+        assert!(!export_base_rewritten(f.root(), &view));
+        assert_eq!(check_export_preconditions(f.root(), &s, &view), None);
+        assert!(
+            plan_export(f.root(), &s, &view).expect("plan").is_empty(),
+            "everything up to the recovered anchor is already published"
+        );
+    }
+
+    #[test]
+    fn one_matching_commit_needs_no_word_about_which_one_was_chosen() {
+        let recovery = AnchorRecovery {
+            missing: "aaa".to_string(),
+            recovered: "bbb".to_string(),
+            pub_sha: "ccc".to_string(),
+            also_matching: 0,
+        };
+        assert_eq!(
+            recovery.message("core"),
+            "core: recovered anchor: aaa → bbb (identical subrepo tree after history rewrite)"
         );
     }
 

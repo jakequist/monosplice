@@ -11,7 +11,9 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::config::ResolvedSubrepo;
-use crate::core::exporter::{compute_exports, export_base_rewritten, plan_export};
+use crate::core::exporter::{
+    compute_exports, export_base_rewritten, find_anchor_recovery, plan_export,
+};
 use crate::core::filter::filtered_subtree;
 use crate::core::git::{git, rev_list};
 use crate::core::importer::{read_sequencer, sequencer_path};
@@ -382,22 +384,66 @@ fn check_subrepo(
     }
 
     if export_base_rewritten(root, &view) {
+        report_rewritten_anchor(&mut section, root, subrepo, &view);
+    }
+
+    verify_mapping(&mut section, root, subrepo, &view);
+    Ok((section, Some(view)))
+}
+
+/// The anchor sha left HEAD's history. Whether that is a problem depends entirely on content:
+/// if some commit still on the walk publishes exactly the tree the standalone repo carries, the
+/// export was correct and `push` re-derives the anchor by itself — a note, not a problem, and
+/// nothing for the user to restore. Otherwise the old refusal stands, `git reflog` and all.
+fn report_rewritten_anchor(
+    section: &mut Section,
+    root: &Path,
+    subrepo: &ResolvedSubrepo,
+    view: &SyncView,
+) {
+    let missing = view
+        .last_exported_mono
+        .clone()
+        .unwrap_or_else(|| "undefined".to_string());
+
+    let recovery = find_anchor_recovery(root, subrepo, view).ok().flatten();
+    let Some(recovery) = recovery else {
         problem(
-            &mut section,
-            format!(
-                "the last exported monorepo commit {} is no longer an ancestor of HEAD.",
-                view.last_exported_mono.as_deref().unwrap_or("undefined")
-            ),
+            section,
+            format!("the last exported monorepo commit {missing} is no longer an ancestor of HEAD."),
             &[
                 "Monorepo history was rewritten (rebase, amend or force-push) underneath it, so the export range",
                 "is meaningless and `monosplice push` will refuse.",
                 "Restore that commit (see `git reflog`) or re-point the branch at history that contains it.",
             ],
         );
-    }
+        return;
+    };
 
-    verify_mapping(&mut section, root, subrepo, &view);
-    Ok((section, Some(view)))
+    let adopt = format!(
+        "`monosplice push {}` adopts {} as the anchor and exports only the work after it.",
+        subrepo.name, recovery.recovered
+    );
+    let mut detail = vec![
+        "Monorepo history was rewritten (rebase, amend or force-push), but that commit's content is still here:",
+        "the rewrite left the published subrepo tree byte-identical, so nothing was lost — only the recorded sha.",
+        adopt.as_str(),
+    ];
+    let adjacent = format!(
+        "{} adjacent commits publish that same tree; the newest is the one adopted.",
+        recovery.also_matching + 1
+    );
+    if recovery.also_matching > 0 {
+        detail.push(adjacent.as_str());
+    }
+    note(
+        section,
+        format!(
+            "the last exported monorepo commit {missing} is no longer an ancestor of HEAD — anchor missing; recoverable via identical tree at {}.",
+            recovery.recovered
+        ),
+        &detail,
+    );
 }
 
 /// The fork is reported separately from upstream and never conflated with it: an unreachable

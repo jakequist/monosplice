@@ -53,6 +53,26 @@ pub fn has_committed_files(root: &Path, rev: &str, subrepo: &ResolvedSubrepo) ->
     !out.is_empty()
 }
 
+/// [`filtered_subtree`] used as an *identity* rather than as a publication: what tree does this
+/// monorepo commit stand for on the public side?
+///
+/// The `scan` hook is deliberately dropped. It inspects a tree, it never shapes one, so whether
+/// content passes a secret scan says nothing about which public tree the commit reproduces —
+/// and a scan tightened after an export (a legacy secret, say) would otherwise veto every
+/// answer, turning a comparison into a refusal. `transform` still runs, because it does shape
+/// the tree. Callers that publish still go through [`filtered_subtree`], scan and all.
+pub fn anchor_subtree(
+    root: &Path,
+    mono_commit: &str,
+    subrepo: &ResolvedSubrepo,
+) -> Result<Option<String>, FilterError> {
+    let for_anchor = ResolvedSubrepo {
+        scan: None,
+        ..subrepo.clone()
+    };
+    filtered_subtree(root, mono_commit, &for_anchor)
+}
+
 /// Tree sha of `subrepo.path` at `mono_commit` after excludes and transform hooks, or `None`
 /// when the path does not exist at that commit. Object-db only — the working tree and index
 /// are never touched.
@@ -267,6 +287,29 @@ mod tests {
         assert!(!listing.contains(".env"), "{listing}");
         assert!(listing.contains("README.md"), "{listing}");
         assert_ne!(tree, repo.sh("git rev-parse HEAD:core"));
+    }
+
+    /// The identity question ("which public tree does this commit stand for?") must survive a
+    /// scan hook that rejects the content, because a scan judges content and never shapes it.
+    #[test]
+    fn an_anchor_subtree_ignores_a_rejecting_scan_but_still_honours_excludes() {
+        let repo = fixture("anchor-subtree");
+        let mut s = subrepo();
+        s.exclude = vec![".env".to_string()];
+        let published = filtered_subtree(repo.path(), "HEAD", &s)
+            .expect("exclude path")
+            .expect("a tree");
+
+        s.scan = Some("exit 1".to_string());
+        assert!(
+            filtered_subtree(repo.path(), "HEAD", &s).is_err(),
+            "publishing still runs the scan"
+        );
+        assert_eq!(
+            anchor_subtree(repo.path(), "HEAD", &s).expect("no scan, no rejection"),
+            Some(published),
+            "...and the exclude still applies"
+        );
     }
 
     #[test]
