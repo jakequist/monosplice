@@ -87,6 +87,7 @@ subrepo, `core/` = the configured subrepo path.
 - [x] S83 A `.gitignore` inside `core/` is exported like any other file; mono root ignores do not leak into pub.
 - [x] S84 Unicode filenames and messages survive round-trip export/import.
 - [x] S85 `--json` output for `status` is stable and machine-parseable (locks the contract for CI use).
+- [x] S86 A `monosplice.toml` only configures the git repository it sits at the top of (`git rev-parse --show-toplevel` from the cwd). An outer monorepo that vendors another monosplice monorepo at `vendor/middle/` carries middle's `monosplice.toml` as ordinary content: every command run from `vendor/middle/` (or below it) refuses, exit ≠ 0, naming the skipped file, the repository it is not the top of, and the config that does apply there (or that there is none) — and writes nothing: no `refs/monosplice/*` in the outer repo, nothing pushed to middle's remotes. The same refusal when the nearest config is *above* the git top level (a parent directory, or the main checkout above a linked worktree whose branch has no config). Unchanged: running from the top level or any subdirectory of an ordinary monorepo, from a linked worktree, through a symlinked path, from a separate git repo nested inside another checkout (its own config applies), and outside any git repository (S80).
 
 ## First contact & adoption (auto-detection matrix)
 

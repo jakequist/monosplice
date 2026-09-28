@@ -7,8 +7,8 @@
 use std::borrow::Borrow;
 use std::path::Path;
 
-use crate::config::{load_project, Project, ResolvedSubrepo};
-use crate::core::git::git_ok;
+use crate::config::{check_config_placement, load_project, Project, ResolvedSubrepo};
+use crate::core::git::{git, git_ok};
 
 /// A command refusing to continue. `message` is the whole user-facing text: `main` prints it
 /// as `Error: <message>` on stderr, newlines and all, and exits with `exit_code`.
@@ -135,6 +135,12 @@ pub fn require_project_from(start_dir: &Path) -> Result<Project, Failure> {
             "No monosplice config found. Run this inside a repo containing monosplice.toml, or run `monosplice init` to create one.",
         ));
     };
+    // No top level (cwd outside any work tree) leaves the not-a-repository check below to
+    // speak, as it always has.
+    if let Ok(toplevel) = git(start_dir, &["rev-parse", "--show-toplevel"]) {
+        check_config_placement(&project.config_path, Path::new(&toplevel))
+            .map_err(|err| Failure::error(err.0))?;
+    }
     if !git_ok(&project.root, &["rev-parse", "--is-inside-work-tree"]) {
         return Err(Failure::error(format!(
             "{} is not a git repository.",

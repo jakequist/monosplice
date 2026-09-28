@@ -141,6 +141,55 @@ pub fn find_config(start_dir: &Path) -> Result<Option<PathBuf>, ConfigError> {
     }
 }
 
+/// A config describes the git repository whose top level holds it, and no other. Refuses a
+/// config found anywhere else: below the top level it belongs to a monorepo vendored inside
+/// this one; above it, to some other tree. Either way every git command would run against
+/// `git_toplevel` with the wrong subrepos — the nested case publishes this repository's
+/// commits straight to the vendored monorepo's remotes.
+///
+/// Paths are compared canonicalized, so a symlinked cwd reaches the same decision as the real
+/// path.
+pub fn check_config_placement(config_path: &Path, git_toplevel: &Path) -> Result<(), ConfigError> {
+    let config_dir = config_path.parent().unwrap_or(Path::new("."));
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let (dir, top) = (canonical(config_dir), canonical(git_toplevel));
+    if dir == top {
+        return Ok(());
+    }
+
+    let top_config = git_toplevel.join(CONFIG_FILENAME);
+    if dir.starts_with(&top) {
+        let next = if top_config.is_file() {
+            format!(
+                "The config for this repository is {}. Run the command from {} to use it, or from a clone of the vendored monorepo to work on that one.",
+                top_config.display(),
+                git_toplevel.display(),
+            )
+        } else {
+            format!(
+                "{} has no {CONFIG_FILENAME} of its own. To work on the vendored monorepo, run the command from a clone of it; to configure this repository, run `monosplice init` in {}.",
+                git_toplevel.display(),
+                git_toplevel.display(),
+            )
+        };
+        return Err(ConfigError(format!(
+            "Skipped {}: {} is not the top of the git repository you are in ({}).\nThat file describes a different monorepo, typically one vendored inside this one; using it here would run its subrepos against {} instead. Nothing was changed.\n{next}",
+            config_path.display(),
+            config_dir.display(),
+            git_toplevel.display(),
+            git_toplevel.display(),
+        )));
+    }
+
+    Err(ConfigError(format!(
+        "Skipped {}: it is outside the git repository you are in ({}), so it does not describe this repository. Nothing was changed.\n{} has no {CONFIG_FILENAME} of its own. Run the command from the repository that file belongs to, or run `monosplice init` in {} to configure this one.",
+        config_path.display(),
+        git_toplevel.display(),
+        git_toplevel.display(),
+        git_toplevel.display(),
+    )))
+}
+
 /// Validate raw TOML text. Exported for unit tests and for the attach/detach reload check.
 pub fn resolve_config(raw: &str, config_path: &Path) -> Result<Vec<ResolvedSubrepo>, ConfigError> {
     let parsed: RawConfig = match toml::from_str(raw) {
@@ -376,6 +425,87 @@ mod tests {
             find_config(dir.path()).unwrap(),
             Some(dir.path().join(CONFIG_FILENAME))
         );
+    }
+
+    // S86: a config only describes the git repository whose top level holds it.
+    #[test]
+    fn config_placement_accepts_a_config_at_the_git_top_level() {
+        let dir = TempDir::new("placement-top");
+        let config = dir.path().join(CONFIG_FILENAME);
+        fs::write(&config, "").unwrap();
+        assert!(check_config_placement(&config, dir.path()).is_ok());
+    }
+
+    #[test]
+    fn config_placement_refuses_a_nested_config_and_names_the_one_that_applies() {
+        let dir = TempDir::new("placement-nested");
+        let nested = dir.path().join("vendor/middle");
+        fs::create_dir_all(&nested).unwrap();
+        let skipped = nested.join(CONFIG_FILENAME);
+        fs::write(&skipped, "").unwrap();
+
+        let without = check_config_placement(&skipped, dir.path())
+            .expect_err("nested config refused")
+            .0;
+        assert!(
+            without.contains(&skipped.display().to_string()),
+            "{without}"
+        );
+        assert!(
+            without.contains("is not the top of the git repository"),
+            "{without}"
+        );
+        assert!(
+            without.contains(&format!(
+                "{} has no {CONFIG_FILENAME}",
+                dir.path().display()
+            )),
+            "{without}"
+        );
+
+        let applies = dir.path().join(CONFIG_FILENAME);
+        fs::write(&applies, "").unwrap();
+        let with = check_config_placement(&skipped, dir.path())
+            .expect_err("still refused when the top level has a config")
+            .0;
+        assert!(
+            with.contains(&format!(
+                "The config for this repository is {}",
+                applies.display()
+            )),
+            "{with}"
+        );
+    }
+
+    #[test]
+    fn config_placement_refuses_a_config_above_the_git_top_level() {
+        let dir = TempDir::new("placement-above");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let above = dir.path().join(CONFIG_FILENAME);
+        fs::write(&above, "").unwrap();
+
+        let message = check_config_placement(&above, &repo)
+            .expect_err("config above the top level refused")
+            .0;
+        assert!(message.contains(&above.display().to_string()), "{message}");
+        assert!(message.contains("outside the git repository"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_placement_sees_through_symlinks() {
+        let dir = TempDir::new("placement-symlink");
+        let real = dir.path().join("real");
+        fs::create_dir_all(real.join("sub")).unwrap();
+        fs::write(real.join(CONFIG_FILENAME), "").unwrap();
+        fs::write(real.join("sub").join(CONFIG_FILENAME), "").unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        assert!(check_config_placement(&alias.join(CONFIG_FILENAME), &real).is_ok());
+        assert!(check_config_placement(&real.join(CONFIG_FILENAME), &alias).is_ok());
+        assert!(check_config_placement(&alias.join("sub").join(CONFIG_FILENAME), &real).is_err());
     }
 
     #[test]

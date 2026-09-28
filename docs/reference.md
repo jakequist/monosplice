@@ -206,7 +206,12 @@ clean, because it commits the index.
 
 `monosplice.toml` sits at the root of your monorepo — that is what `monosplice init` writes.
 Every command walks up from the current directory looking for it, and the directory holding it
-is the monorepo root. There is exactly one filename; nothing is loaded, compiled or evaluated,
+is the monorepo root. That directory must be the top level of the git repository you are in
+(`git rev-parse --show-toplevel`): a `monosplice.toml` found anywhere else — inside a vendored
+copy of another monosplice monorepo, or in a directory above the repository — describes some
+other repository, so every command refuses, names the file it skipped and the config that
+applies, and changes nothing. A linked worktree or a submodule is its own top level. There is
+exactly one filename; nothing is loaded, compiled or evaluated,
 so there is no build step, no plugin, and no way for a config file to do anything but describe
 subrepos.
 
