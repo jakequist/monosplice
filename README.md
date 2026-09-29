@@ -154,10 +154,11 @@ No magic, no daemon, no lock-in.
 **Two histories, one mapping.** The monorepo and each standalone repo have independent
 histories; monosplice replays commits between them and records the correspondence in commit
 trailers (the `Key: value` lines git keeps at the end of a commit message) — exports carry
-`Monosplice-Source: <monorepo-sha>`, imports carry `Monosplice-Origin: <standalone-sha>`, and a
-trailer only ever describes the one hop that wrote it — a replay never forwards them, and a
-claim naming another monorepo's commit (a repo you vendor that somebody else publishes) is not
-mistaken for yours ([chains of monorepos](docs/reference.md#chains-of-monorepos-whose-trailer-is-it)). Each
+`Monosplice-Source: <monorepo-sha>` (plus `Monosplice-Monorepo: <id>` naming the monorepo that
+wrote it), imports carry `Monosplice-Origin: <standalone-sha>`, and a trailer only ever
+describes the one hop that wrote it — a replay never forwards them, and whose claim is whose is
+decided on evidence, never guessed: when it cannot be shown, every command stops and says so
+([chains of monorepos](docs/reference.md#chains-of-monorepos-whose-trailer-is-it)). Each
 export is built with git plumbing (`ls-tree`, `mktree`, `commit-tree`) and preserves the
 original author and dates. The remote ref is written exactly once — after every commit and
 every hook has succeeded. Commits that touch nothing exportable produce no commit on the
@@ -266,10 +267,10 @@ Things monosplice won't do, listed here so you don't find out the hard way:
   appear in standalone-repo history, permanently. They reveal nothing but 40 hex characters,
   but know it's there before you publish. They go one hop and no further: a commit replayed
   onward carries only the trailer of the hop that replayed it.
-- **One publisher per standalone branch, as far as `push` can tell.** If a second monorepo
-  exports straight onto a branch you publish, your `push` stops at its first commit there,
-  because a `Monosplice-Source` it cannot resolve could be an export of yours it cannot see.
-  Vendoring a repo that another monorepo publishes, and pushing patches back to it, works.
+- **Two publishers on one branch need ids.** A monorepo created by `monosplice init` has an
+  `id` and reads another monorepo's exports as that monorepo's work, to pull. A 1.0.0-era
+  monorepo without one cannot tell an id-less export it cannot resolve from one of its own it
+  cannot see, so it stops there — loudly, in `status`, `pull`, `push` and `doctor`.
 - **No shallow clones.** Sync state is re-derived by walking history, so a shallow monorepo
   clone stops with an error rather than guessing.
 - **`status` talks to the network by default.** Re-deriving state is a couple of `git log`

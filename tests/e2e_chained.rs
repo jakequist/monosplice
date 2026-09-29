@@ -1,4 +1,4 @@
-//! e2e (S170–S175): chained monorepos, and trailers that belong to some other repository.
+//! e2e (S170–S175, S183): chained monorepos, and trailers that belong to some other repository.
 //!
 //! An **outer** monorepo vendors a **middle** monorepo, which splices `lib/` out to a **leaf**
 //! repo; or a monorepo vendors a repo that another monorepo publishes. Each hop records its
@@ -6,10 +6,11 @@
 //! next repository, where it read as that repository's own claim; and a `Monosplice-Source`
 //! naming another monorepo's commit was taken for this monorepo's export.
 //!
-//! The rules under test: a replay strips the sync trailers it finds and appends only its own
-//! (S170); of the trailers already published, only the last one on a commit is its claim
-//! (S171); a claim is this monorepo's only if it can be (S172, S173), and one that could still
-//! be ours stops exactly as before (S174); `doctor` mentions the rest as information (S175).
+//! The rules under test: a replay strips the sync lines it finds, wherever they sit, and appends
+//! only its own (S170, S183); of the trailers already published, only the last one on a commit
+//! is its claim (S171); a claim is another monorepo's only when that can be shown (S172, S173),
+//! and one that could still be ours stops and says so (S174); `doctor` mentions the rest as
+//! information (S175). The ownership rules themselves are in tests/e2e_ownership.rs.
 
 mod common;
 
