@@ -16,7 +16,7 @@ use crate::core::git::{
     EMPTY_TREE,
 };
 use crate::core::paths::make_excluder;
-use crate::core::trailers::{append_trailer, ORIGIN_TRAILER};
+use crate::core::trailers::{append_trailer, strip_sync_trailers, ORIGIN_TRAILER};
 
 /// The standalone-repo commit currently being replayed, captured so `--continue` can finish it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,7 +207,10 @@ fn commit_import(root: &Path, c: &PullSequencerCommit) -> Result<String, GitErro
     // --allow-empty: when the monorepo independently made the identical change the patch is
     // a no-op, but the commit (and its Origin trailer) is what marks the pub commit
     // reflected — skip it and push would refuse forever.
-    let message = append_trailer(&c.message, ORIGIN_TRAILER, &c.sha);
+    // The standalone commit's own sync trailers describe the hop that published it (a
+    // `Monosplice-Source` naming *its* monorepo); copied here they would read as this
+    // monorepo's claims. Only the Origin this import writes is kept.
+    let message = append_trailer(&strip_sync_trailers(&c.message), ORIGIN_TRAILER, &c.sha);
     // Author is the public commit's; the committer is whoever is running monosplice, which
     // is why it is left to the inherited environment.
     let env = [

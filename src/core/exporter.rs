@@ -18,7 +18,9 @@ use crate::core::sync_view::{
     fork_tracking_ref, load_fork_state, remote_tracking_ref, unpublished_view, SyncView,
     SyncViewOptions,
 };
-use crate::core::trailers::{append_trailer, get_trailer, ORIGIN_TRAILER, SOURCE_TRAILER};
+use crate::core::trailers::{
+    append_trailer, get_trailer, strip_sync_trailers, ORIGIN_TRAILER, SOURCE_TRAILER,
+};
 
 #[derive(Debug, Clone)]
 pub struct ExportCandidate {
@@ -179,7 +181,10 @@ pub fn compute_exports(
         if let Some(cmd) = &subrepo.rewrite_message {
             message = run_rewrite_message(cmd, root, &subrepo.name, &meta.sha, &meta.message)?;
         }
-        message = append_trailer(&message, SOURCE_TRAILER, &meta.sha);
+        // Sync trailers already in the message belong to the hop that wrote them; forwarded,
+        // they would read as claims about this standalone repo. `rewrite-message` runs first,
+        // so a hook cannot put them back either.
+        message = append_trailer(&strip_sync_trailers(&message), SOURCE_TRAILER, &meta.sha);
 
         planned.push(PlannedExport {
             mono_sha: meta.sha.clone(),

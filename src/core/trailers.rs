@@ -102,6 +102,52 @@ pub fn get_trailer(message: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Is this line one of monosplice's own sync trailers? Keys compare case-insensitively, the
+/// way git's trailer parsing (which the sync view reads through) compares them.
+fn is_sync_trailer_line(line: &str) -> bool {
+    let Some(idx) = line.find(':') else {
+        return false;
+    };
+    let key = line[..idx].trim_end_matches(is_space);
+    key.eq_ignore_ascii_case(SOURCE_TRAILER) || key.eq_ignore_ascii_case(ORIGIN_TRAILER)
+}
+
+/// Remove every `Monosplice-Source` / `Monosplice-Origin` line from the final paragraph of a
+/// message, dropping the paragraph if nothing else was in it.
+///
+/// A sync trailer states a fact about the one hop that wrote it: this commit reflects that
+/// commit, in the repository on the other side of *that* boundary. Carried into the next
+/// repository it reads as that repository's own claim, so every replay strips them before
+/// appending its own. The whole final paragraph is searched, not just a strict trailer block:
+/// git also reads trailers from a paragraph that mixes them with prose once a git-generated
+/// trailer such as `Signed-off-by` is present.
+///
+/// A message with nothing to strip is returned byte-for-byte, so a single-hop replay produces
+/// exactly the message it always did.
+pub fn strip_sync_trailers(message: &str) -> String {
+    let normalized = message.replace("\r\n", "\n");
+    let body = trim_end_js(&normalized);
+    // The subject is never a trailer; a one-paragraph message has nothing to strip.
+    let Some(split) = body.rfind("\n\n") else {
+        return message.to_string();
+    };
+    let last = &body[split + 2..];
+    let lines: Vec<&str> = last.split('\n').collect();
+    let kept: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| !is_sync_trailer_line(line))
+        .collect();
+    if kept.len() == lines.len() {
+        return message.to_string();
+    }
+    let head = trim_end_js(&body[..split]);
+    if kept.iter().all(|line| trim_js(line).is_empty()) {
+        return format!("{head}\n");
+    }
+    format!("{head}\n\n{}\n", kept.join("\n"))
+}
+
 /// Append a trailer to a commit message, extending an existing trailer block if
 /// the message ends with one, otherwise starting a new block.
 pub fn append_trailer(message: &str, key: &str, value: &str) -> String {
@@ -229,6 +275,52 @@ mod tests {
     fn paragraphs_split_on_runs_of_two_or_more_newlines() {
         let msg = "subj\n\n\n\nMonosplice-Source: aaa";
         assert_eq!(get_trailer(msg, SOURCE_TRAILER).as_deref(), Some("aaa"));
+    }
+
+    #[test]
+    fn strip_leaves_a_message_without_sync_trailers_byte_for_byte() {
+        for msg in [
+            "feat: x",
+            "feat: x\n",
+            "feat: x\r\n\r\nbody\r\n",
+            "feat: x\n\n\n\nbody\n\nSigned-off-by: A <a@b.c>\n\n\n",
+            "Monosplice-Source: only a subject",
+        ] {
+            assert_eq!(strip_sync_trailers(msg), msg);
+        }
+    }
+
+    #[test]
+    fn strip_removes_forwarded_sync_trailers_and_keeps_the_rest() {
+        assert_eq!(
+            strip_sync_trailers("outer: patch lib\n\nMonosplice-Source: abc\n"),
+            "outer: patch lib\n"
+        );
+        assert_eq!(
+            strip_sync_trailers(
+                "fix: y\n\nBody.\n\nSigned-off-by: A <a@b.c>\nMonosplice-Origin: l1\nmonosplice-source: m1\nCo-authored-by: B <b@c.d>\n"
+            ),
+            "fix: y\n\nBody.\n\nSigned-off-by: A <a@b.c>\nCo-authored-by: B <b@c.d>\n"
+        );
+        // A paragraph git would read as trailers because of Signed-off-by, prose included.
+        assert_eq!(
+            strip_sync_trailers("s\n\nSigned-off-by: A <a@b.c>\nMonosplice-Source: m\nprose\n"),
+            "s\n\nSigned-off-by: A <a@b.c>\nprose\n"
+        );
+        // Only the final paragraph holds trailers; an earlier one is body text.
+        let body_mention = "s\n\nMonosplice-Source: in the body\n\nTicket: 7\n";
+        assert_eq!(strip_sync_trailers(body_mention), body_mention);
+    }
+
+    #[test]
+    fn strip_then_append_leaves_exactly_one_sync_trailer() {
+        let forwarded = "outer: patch lib\n\nMonosplice-Source: outer\n";
+        let out = append_trailer(&strip_sync_trailers(forwarded), SOURCE_TRAILER, "middle");
+        assert_eq!(out, "outer: patch lib\n\nMonosplice-Source: middle\n");
+
+        let doubled = "leaf: add b\n\nMonosplice-Origin: leaf\nMonosplice-Origin: middle\n";
+        let out = append_trailer(&strip_sync_trailers(doubled), ORIGIN_TRAILER, "outer");
+        assert_eq!(out, "leaf: add b\n\nMonosplice-Origin: outer\n");
     }
 
     #[test]
