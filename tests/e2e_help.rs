@@ -61,15 +61,19 @@ fn every_command_has_its_own_help() {
     }
 }
 
+/// S185: between releases the crate carries the next version with a `-dev` suffix, so a build
+/// from `main` can never be mistaken for the release it came after (and a check that insists on
+/// `monosplice 1.0.0` — the fixture generator's — tells the two apart).
 #[test]
 fn version_prints_the_crate_version() {
     let sb = sandbox();
     let res = run_monosplice(sb.path(), &["-V"]);
     assert_eq!(res.exit_code, 0, "stderr: {}", res.stderr);
-    assert_eq!(res.stdout.trim(), "monosplice 1.0.0");
+    assert_eq!(res.stdout.trim(), "monosplice 1.1.0-dev");
 
     let long = run_monosplice(sb.path(), &["--version"]);
-    assert_eq!(long.stdout.trim(), "monosplice 1.0.0");
+    assert_eq!(long.stdout.trim(), "monosplice 1.1.0-dev");
+    assert_ne!(long.stdout.trim(), "monosplice 1.0.0");
 }
 
 #[test]
