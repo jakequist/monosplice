@@ -522,6 +522,12 @@ pub fn sync_trailers(
     Ok(parse_sync_trailers(&out))
 }
 
+/// Is this clone shallow? Commits beyond the shallow boundary are missing without having been
+/// rewritten, so a trailer naming one could be anybody's.
+pub fn is_shallow(cwd: &Path) -> bool {
+    git(cwd, &["rev-parse", "--is-shallow-repository"]).is_ok_and(|out| out == "true")
+}
+
 /// Resolve a branch head on a remote. Returns the sha, None if the branch (or an
 /// empty repo) has no such ref, and a GitError if the remote is unreachable.
 pub fn ls_remote_branch(
@@ -942,6 +948,7 @@ Monosplice-Source: deadbeef
             tv.get(&commits[1]).unwrap(),
             &vec![SyncTrailer::Source("deadbeef".to_string())]
         );
+        assert!(!is_shallow(d));
 
         let entries = ls_tree_recursive(d, "HEAD").unwrap();
         assert_eq!(entries.len(), 2);

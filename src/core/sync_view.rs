@@ -10,8 +10,8 @@ use std::path::Path;
 use crate::config::ResolvedSubrepo;
 use crate::core::filter::anchor_subtree;
 use crate::core::git::{
-    existing_commits, fetch_branch, git, git_with, ls_remote_branch, missing_objects, rev_list,
-    rev_parse, sync_trailers, GitError, GitOpts,
+    existing_commits, fetch_branch, git, git_with, is_shallow, ls_remote_branch, missing_objects,
+    rev_list, rev_parse, sync_trailers, GitError, GitOpts,
 };
 use crate::core::trailers::SyncTrailer;
 
@@ -127,6 +127,12 @@ pub struct SyncView {
     /// has, that anchor decides what is published and the dead trailers below it can no longer
     /// change the answer — they are reported and never refused.
     pub superseded_source_refs: Vec<BrokenSourceRef>,
+    /// `Monosplice-Source` claims on the standalone branch that name another monorepo's commits,
+    /// not this one's: the repository is also published from somewhere else, or it is a
+    /// vendored copy of a repository that is. They are never part of the mapping — neither
+    /// exports to skip nor anchors to validate — so the commits carrying them are ordinary
+    /// standalone work that `pull` imports. See [`classify_claims`] for how each is recognised.
+    pub foreign_source_refs: Vec<BrokenSourceRef>,
     /// `Monosplice-Source` trailers on the standalone branch that are not the last sync trailer
     /// of their commit: forwarded from an earlier hop (monosplice 1.0.0 copied them). Ignored.
     pub forwarded_source_trailers: usize,
@@ -151,6 +157,7 @@ pub fn unpublished_view(name: &str) -> SyncView {
         unreflected_pub: Vec::new(),
         broken_source_refs: Vec::new(),
         superseded_source_refs: Vec::new(),
+        foreign_source_refs: Vec::new(),
         forwarded_source_trailers: 0,
         forwarded_origin_trailers: 0,
         related: false,
@@ -221,6 +228,7 @@ fn reflects_exactly(root: &Path, s: &ResolvedSubrepo, mono_sha: &str, pub_sha: &
 fn find_export_anchor(
     root: &Path,
     s: &ResolvedSubrepo,
+    head_walk: &[String],
     exported_mono_to_pub: &HashMap<String, String>,
     origin_by_mono: &HashMap<String, Vec<String>>,
     pub_ancestors: &HashSet<String>,
@@ -230,7 +238,7 @@ fn find_export_anchor(
     }
 
     let mut related = !exported_mono_to_pub.is_empty();
-    for mono_sha in rev_list(root, &["HEAD"])? {
+    for mono_sha in head_walk.iter().cloned() {
         if exported_mono_to_pub.contains_key(&mono_sha) {
             return Ok((Some(mono_sha), true));
         }
@@ -253,17 +261,23 @@ fn find_export_anchor(
 
 /// Public commits the monorepo has not seen. Ancestry, not per-commit bookkeeping: a shallow
 /// snapshot `attach` records only the pub head as imported, and every ancestor of a reflected
-/// commit is reflected by construction. Our own exports drop out by trailer.
+/// commit is reflected by construction. Our own exports drop out by trailer, and so does their
+/// ancestry: an export was only ever made on top of a standalone head the monorepo had already
+/// reflected, so whatever sits below a live export is settled.
+///
+/// Only this monorepo's claims drop out. A commit carrying another monorepo's
+/// `Monosplice-Source` is somebody else's published work, and is imported like any other.
 fn find_unreflected_pub(
     root: &Path,
     tracking_ref: &str,
     imported_pub_shas: &HashSet<String>,
-    source_by_pub: &HashMap<String, Vec<String>>,
+    claims: &Claims,
 ) -> Result<Vec<String>, GitError> {
     // A forged or force-pushed-away Origin value would abort the whole rev-list, so only
     // values that resolve to a commit here are allowed to negate anything.
     let candidates: Vec<String> = imported_pub_shas.iter().cloned().collect();
-    let reflected = existing_commits(root, &candidates)?;
+    let mut reflected = existing_commits(root, &candidates)?;
+    reflected.extend(claims.exported_pub.iter().cloned());
     let out = if reflected.is_empty() {
         git(root, &["rev-list", "--reverse", tracking_ref])?
     } else {
@@ -283,7 +297,7 @@ fn find_unreflected_pub(
     }
     Ok(out
         .split('\n')
-        .filter(|sha| !source_by_pub.contains_key(*sha))
+        .filter(|sha| !claims.ours_pub.contains(*sha))
         .map(str::to_string)
         .collect())
 }
@@ -316,6 +330,243 @@ fn writer_claims(
     (claims, forwarded)
 }
 
+/// What a standalone commit's `Monosplice-Source` claim names, as far as object lookups can say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolved {
+    /// A commit on HEAD's history: this monorepo's export.
+    OnHead,
+    /// A commit this clone has but HEAD does not reach, found in a standalone repository
+    /// monosplice fetched (`refs/monosplice/*`): another repository's commit, never ours.
+    Fetched,
+    /// A commit this clone has, off HEAD and in no fetched repository: ours, rewritten away
+    /// (rebase, amend, force-push) — the case rewrite detection and anchor recovery handle.
+    OffHead,
+    /// Not a commit here at all.
+    Missing,
+}
+
+/// The claims split by whose they are, plus the parts of the view derived from them.
+#[derive(Debug, Default)]
+struct Claims {
+    exported_mono_to_pub: HashMap<String, String>,
+    last_exported_mono: Option<String>,
+    broken: Vec<BrokenSourceRef>,
+    superseded: Vec<BrokenSourceRef>,
+    foreign: Vec<BrokenSourceRef>,
+    /// Standalone commits carrying a claim of this monorepo's (resolvable or not).
+    ours_pub: HashSet<String>,
+    /// Standalone commits carrying a claim that resolves to one of our commits.
+    exported_pub: Vec<String>,
+}
+
+/// Which of these standalone commits could be exports of commits on HEAD's history that a
+/// rewrite has since given new shas? An export copies author email, author time and — unless a
+/// `rewrite-message` hook rewrites it on the way out — the subject from the monorepo commit,
+/// and a rebase, amend or `filter-repo` keeps all three. Two git calls, however many commits.
+fn authored_like_ours<'a>(
+    root: &Path,
+    s: &ResolvedSubrepo,
+    pub_shas: &[&'a String],
+) -> Result<HashSet<&'a String>, GitError> {
+    let with_subject = s.rewrite_message.is_none();
+    let key = |ae: &str, at: &str, subject: &str| {
+        if with_subject {
+            format!("{ae}\0{at}\0{subject}")
+        } else {
+            format!("{ae}\0{at}")
+        }
+    };
+    let ours: HashSet<String> = git(
+        root,
+        &["log", "--format=%ae%x00%at%x00%s", "HEAD", "--", &s.path],
+    )?
+    .split('\n')
+    .filter_map(|line| {
+        let mut f = line.splitn(3, '\0');
+        Some(key(f.next()?, f.next()?, f.next().unwrap_or("")))
+    })
+    .collect();
+
+    let input: String = pub_shas.iter().map(|sha| format!("{sha}\n")).collect();
+    let theirs = git_with(
+        root,
+        &[
+            "log",
+            "--no-walk=unsorted",
+            "--stdin",
+            "--format=%H%x00%ae%x00%at%x00%s",
+        ],
+        GitOpts {
+            input: Some(input.as_bytes()),
+            ..Default::default()
+        },
+    )?;
+    let mut hits: HashSet<&'a String> = HashSet::new();
+    for line in theirs.split('\n') {
+        let mut f = line.splitn(4, '\0');
+        let (Some(sha), Some(ae), Some(at)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        if ours.contains(&key(ae, at, f.next().unwrap_or(""))) {
+            if let Some(pub_sha) = pub_shas.iter().find(|p| p.as_str() == sha) {
+                hits.insert(pub_sha);
+            }
+        }
+    }
+    Ok(hits)
+}
+
+/// Decide, for every `Monosplice-Source` claim on the standalone branch, whether it is this
+/// monorepo's — and so part of the mapping — or another monorepo's, which is ignored.
+///
+/// A claim is ours when it names a commit on HEAD's history, or a commit this clone has that
+/// HEAD no longer reaches and that did not arrive from a standalone repository (a rewrite,
+/// which rewrite detection still refuses or recovers). It is foreign when it names a commit
+/// monosplice fetched from some *other* standalone repository, or when it sits on a standalone
+/// commit this monorepo imported: an import is by construction something we did not write.
+///
+/// A claim naming no commit here is where "foreign" and "cannot tell" part, and monosplice never
+/// guesses:
+///
+/// - Below the newest claim that resolves as ours, nothing can change what is published: it is
+///   history, reported as superseded (or as foreign, once the branch is known to have another
+///   publisher).
+/// - Above it, a claim could be ours in a shallow clone (every such claim is), or when one of
+///   our commits carries the same authorship — an export copies it and a rebase, amend or
+///   `filter-repo` keeps it. Those stop, as they always did.
+/// - The rest are foreign when this monorepo has never exported to the branch (nothing of ours
+///   can be missing from it: a vendored copy of somebody else's publication), or when the
+///   branch has already shown another publisher by one of the certain rules above. On a branch
+///   this monorepo publishes and nobody else visibly does, a claim nobody can place is still a
+///   broken mapping.
+fn classify_claims(
+    root: &Path,
+    s: &ResolvedSubrepo,
+    pub_walk: &[String],
+    head_walk: &[String],
+    source_by_pub: &HashMap<String, String>,
+    imported_pub_shas: &HashSet<String>,
+) -> Result<Claims, GitError> {
+    let mut claimed: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for pub_sha in pub_walk {
+        if let Some(mono_sha) = source_by_pub.get(pub_sha) {
+            if seen.insert(mono_sha.as_str()) {
+                claimed.push(mono_sha.clone());
+            }
+        }
+    }
+    let missing = missing_objects(root, &claimed)?;
+    let on_head: HashSet<&str> = head_walk.iter().map(String::as_str).collect();
+    let off_head = claimed
+        .iter()
+        .any(|sha| !missing.contains(sha) && !on_head.contains(sha.as_str()));
+    let fetched: HashSet<String> = if !off_head {
+        HashSet::new()
+    } else if head_walk.is_empty() {
+        rev_list(root, &["--glob=refs/monosplice"])?
+            .into_iter()
+            .collect()
+    } else {
+        rev_list(root, &["--glob=refs/monosplice", "--not", "HEAD"])?
+            .into_iter()
+            .collect()
+    };
+    let resolve = |mono_sha: &String| {
+        if missing.contains(mono_sha) {
+            Resolved::Missing
+        } else if on_head.contains(mono_sha.as_str()) {
+            Resolved::OnHead
+        } else if fetched.contains(mono_sha) {
+            Resolved::Fetched
+        } else {
+            Resolved::OffHead
+        }
+    };
+
+    let mut any_ours = false;
+    let mut other_publisher = false;
+    for (pub_sha, mono_sha) in source_by_pub {
+        match resolve(mono_sha) {
+            Resolved::OnHead | Resolved::OffHead => any_ours = true,
+            Resolved::Fetched => other_publisher = true,
+            Resolved::Missing => other_publisher |= imported_pub_shas.contains(pub_sha),
+        }
+    }
+
+    // Unplaceable claims above the newest claim that resolves as ours: the only ones whose
+    // owner matters, because nothing below a readable anchor can change what is published.
+    let newest_ours = pub_walk.iter().position(|pub_sha| {
+        source_by_pub
+            .get(pub_sha)
+            .is_some_and(|m| matches!(resolve(m), Resolved::OnHead | Resolved::OffHead))
+    });
+    let unplaceable: Vec<&String> = pub_walk[..newest_ours.unwrap_or(pub_walk.len())]
+        .iter()
+        .filter(|pub_sha| {
+            !imported_pub_shas.contains(*pub_sha)
+                && source_by_pub
+                    .get(*pub_sha)
+                    .is_some_and(|m| resolve(m) == Resolved::Missing)
+        })
+        .collect();
+    let mut looks_ours: HashSet<&String> = HashSet::new();
+    let mut all_could_be_ours = false;
+    if !unplaceable.is_empty() {
+        if is_shallow(root) || head_walk.is_empty() {
+            all_could_be_ours = true;
+        } else {
+            looks_ours = authored_like_ours(root, s, &unplaceable)?;
+        }
+    }
+    // One of our exports we cannot see means this branch has others we cannot see either.
+    let publishes_here = any_ours || !looks_ours.is_empty();
+
+    let mut out = Claims::default();
+    for pub_sha in pub_walk {
+        let Some(mono_sha) = source_by_pub.get(pub_sha) else {
+            continue;
+        };
+        let claim = BrokenSourceRef {
+            pub_sha: pub_sha.clone(),
+            mono_sha: mono_sha.clone(),
+        };
+        let ours = match resolve(mono_sha) {
+            Resolved::OnHead | Resolved::OffHead => {
+                if out.last_exported_mono.is_none() {
+                    out.last_exported_mono = Some(mono_sha.clone());
+                }
+                out.exported_pub.push(pub_sha.clone());
+                true
+            }
+            Resolved::Fetched => false,
+            Resolved::Missing if imported_pub_shas.contains(pub_sha) => false,
+            Resolved::Missing if out.last_exported_mono.is_some() => !other_publisher,
+            Resolved::Missing => {
+                all_could_be_ours
+                    || looks_ours.contains(pub_sha)
+                    || (publishes_here && !other_publisher)
+            }
+        };
+        if !ours {
+            out.foreign.push(claim);
+            continue;
+        }
+        out.ours_pub.insert(pub_sha.clone());
+        out.exported_mono_to_pub
+            .entry(mono_sha.clone())
+            .or_insert_with(|| pub_sha.clone());
+        if resolve(mono_sha) == Resolved::Missing {
+            if out.last_exported_mono.is_some() {
+                out.superseded.push(claim);
+            } else {
+                out.broken.push(claim);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Derive every sync cursor from trailers. There is no state file: this runs on each
 /// invocation. `ls_remote_branch` goes first so an unreachable remote fails with a GitError
 /// carrying git's own stderr, and a missing branch is reported as "not published yet" rather
@@ -333,9 +584,8 @@ pub fn load_sync_view(
         ls_remote_branch(root, source, &s.branch)?
     };
 
-    // Only the last sync trailer on a commit is the claim of the hop that wrote it; any before
-    // it were forwarded from an earlier hop and name some other repository's commits.
-    let mono_trailers = if rev_parse(root, "HEAD").is_some() {
+    let head_exists = rev_parse(root, "HEAD").is_some();
+    let mono_trailers = if head_exists {
         sync_trailers(root, &["HEAD"])?
     } else {
         HashMap::new()
@@ -365,86 +615,53 @@ pub fn load_sync_view(
         fetch_branch(root, source, &s.branch, &tracking_ref)?;
     }
 
-    let (writer_sources, forwarded_source_trailers) =
+    let (source_by_pub, forwarded_source_trailers) =
         writer_claims(&sync_trailers(root, &[&tracking_ref])?, true);
-    let source_by_pub: HashMap<String, Vec<String>> = writer_sources
-        .into_iter()
-        .map(|(pub_sha, mono_sha)| (pub_sha, vec![mono_sha]))
-        .collect();
 
-    // The pub walk drives both the mapping and the broken-ref scan. Newest first, so the
-    // newest public commit claiming a monorepo commit is the one the mapping records — the
-    // insertion order of the TS `Map`, made explicit because a Rust HashMap has none.
+    // Newest first, so the newest public commit claiming a monorepo commit is the one the
+    // mapping records, and validation stops at the newest claim that resolves as ours: that
+    // commit is where the mapping is still readable, and everything below it is already
+    // published by construction.
     let pub_walk = rev_list(root, &[&tracking_ref])?;
-    let mut exported_mono_to_pub: HashMap<String, String> = HashMap::new();
-    let mut exported_mono_order: Vec<String> = Vec::new();
-    for pub_sha in &pub_walk {
-        let Some(values) = source_by_pub.get(pub_sha) else {
-            continue;
-        };
-        for mono_sha in values {
-            if !exported_mono_to_pub.contains_key(mono_sha) {
-                exported_mono_to_pub.insert(mono_sha.clone(), pub_sha.clone());
-                exported_mono_order.push(mono_sha.clone());
-            }
-        }
-    }
+    let pub_ancestors: HashSet<String> = pub_walk.iter().cloned().collect();
+    let head_walk = if head_exists && !(source_by_pub.is_empty() && origin_by_mono.is_empty()) {
+        rev_list(root, &["HEAD"])?
+    } else {
+        Vec::new()
+    };
 
-    let missing = missing_objects(root, &exported_mono_order)?;
-    let mut broken_source_refs: Vec<BrokenSourceRef> = Vec::new();
-    let mut superseded_source_refs: Vec<BrokenSourceRef> = Vec::new();
-
-    // Newest first, and validation stops at the newest trailer that resolves: that commit is
-    // where the mapping is still readable, and everything below it is already published by
-    // construction. A dead trailer above it (or before any resolve) leaves a stretch of public
-    // history whose provenance cannot be checked at all — that is the broken mapping. A dead
-    // trailer below it is the fossil of a rewrite that a later export already superseded.
-    let mut pub_ancestors: HashSet<String> = HashSet::new();
-    let mut last_exported_mono: Option<String> = None;
-    for pub_sha in &pub_walk {
-        pub_ancestors.insert(pub_sha.clone());
-        let Some(values) = source_by_pub.get(pub_sha) else {
-            continue;
-        };
-        for mono_sha in values {
-            if missing.contains(mono_sha) {
-                let dead = BrokenSourceRef {
-                    pub_sha: pub_sha.clone(),
-                    mono_sha: mono_sha.clone(),
-                };
-                if last_exported_mono.is_some() {
-                    superseded_source_refs.push(dead);
-                } else {
-                    broken_source_refs.push(dead);
-                }
-            } else if last_exported_mono.is_none() {
-                last_exported_mono = Some(mono_sha.clone());
-            }
-        }
-    }
+    let claims = classify_claims(
+        root,
+        s,
+        &pub_walk,
+        &head_walk,
+        &source_by_pub,
+        &imported_pub_shas,
+    )?;
 
     let (export_base, related) = find_export_anchor(
         root,
         s,
-        &exported_mono_to_pub,
+        &head_walk,
+        &claims.exported_mono_to_pub,
         &origin_by_mono,
         &pub_ancestors,
     )?;
 
-    let unreflected_pub =
-        find_unreflected_pub(root, &tracking_ref, &imported_pub_shas, &source_by_pub)?;
+    let unreflected_pub = find_unreflected_pub(root, &tracking_ref, &imported_pub_shas, &claims)?;
 
     Ok(SyncView {
         tracking_ref,
         pub_head: Some(pub_head),
-        exported_mono_to_pub,
+        exported_mono_to_pub: claims.exported_mono_to_pub,
         imported_pub_shas,
         origin_by_mono,
         export_base,
-        last_exported_mono,
+        last_exported_mono: claims.last_exported_mono,
         unreflected_pub,
-        broken_source_refs,
-        superseded_source_refs,
+        broken_source_refs: claims.broken,
+        superseded_source_refs: claims.superseded,
+        foreign_source_refs: claims.foreign,
         forwarded_source_trailers,
         forwarded_origin_trailers,
         related,
@@ -754,9 +971,13 @@ mod tests {
         assert_eq!(view.export_base, None);
     }
 
+    /// The shape of a vendored copy of a repository another monorepo publishes: every claim
+    /// names a commit this monorepo never had, and it has never exported here. Nothing of ours
+    /// can be missing from a branch we never published to, so the claims are that other
+    /// monorepo's — not a mapping, not a relationship, not an error.
     #[test]
-    fn a_pub_commit_naming_an_unknown_mono_sha_is_a_broken_source_ref() {
-        let f = Fixture::new("broken-source");
+    fn a_claim_on_a_branch_we_never_exported_to_is_foreign_not_broken() {
+        let f = Fixture::new("foreign-source");
         let tree = f.sh("git rev-parse HEAD:core");
         let bogus = "0".repeat(40);
         let pub_sha = f.push_pub(
@@ -766,15 +987,182 @@ mod tests {
         );
 
         let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
+        assert!(view.broken_source_refs.is_empty());
+        assert_eq!(view.foreign_source_refs.len(), 1);
+        assert_eq!(view.foreign_source_refs[0].pub_sha, pub_sha);
+        assert_eq!(view.foreign_source_refs[0].mono_sha, bogus);
+        assert!(view.exported_mono_to_pub.is_empty());
+        assert_eq!(view.last_exported_mono, None);
+        // First contact, as for any repository nobody here has touched: `attach` decides.
+        assert!(!view.related);
+        assert_eq!(view.unreflected_pub, vec![pub_sha]);
+    }
+
+    /// The same branch seen from a shallow clone: a missing commit may simply be beyond the
+    /// shallow boundary, so the claim could be ours and the old refusal stands.
+    #[test]
+    fn in_a_shallow_clone_an_unplaceable_claim_is_a_broken_source_ref() {
+        let f = Fixture::new("shallow-source");
+        let tree = f.sh("git rev-parse HEAD:core");
+        let bogus = "0".repeat(40);
+        let pub_sha = f.push_pub(
+            &tree,
+            None,
+            &format!("export\n\nMonosplice-Source: {bogus}\n"),
+        );
+        f.commit("second commit");
+        let shallow = f.dir.join("shallow");
+        sh(
+            &f.dir,
+            &format!(
+                "git clone -q --depth 1 file://{} {}",
+                f.mono.display(),
+                shallow.display()
+            ),
+            f.next_date(),
+        );
+
+        let view = load_sync_view(&shallow, &f.subrepo(), &online()).expect("view");
         assert_eq!(view.broken_source_refs.len(), 1);
         assert_eq!(view.broken_source_refs[0].pub_sha, pub_sha);
-        assert_eq!(view.broken_source_refs[0].mono_sha, bogus);
-        // A broken claim never becomes the rewrite-detection cursor.
+        assert!(view.foreign_source_refs.is_empty());
         assert_eq!(view.last_exported_mono, None);
-        // ...and it still counts as "related": pub is talking about us.
         assert!(view.related);
-        // Nothing resolves anywhere, so nothing supersedes it either.
-        assert!(view.superseded_source_refs.is_empty());
+        assert!(view.unreflected_pub.is_empty());
+    }
+
+    /// A rewrite (rebase, amend, `filter-repo`) gives our exported commit a new sha but keeps its
+    /// authorship, which the export copied. A clone made afterwards cannot resolve the claim,
+    /// yet a commit on its history is recognisably the one exported: the claim could be ours.
+    #[test]
+    fn an_unplaceable_claim_authored_like_one_of_our_commits_is_a_broken_source_ref() {
+        let f = Fixture::new("authored-like-ours");
+        f.sh("printf 'two\n' > core/two.txt");
+        let ours = f.commit("feat: two");
+        let tree = f.sh("git rev-parse HEAD:core");
+        let (ae, ad) = (
+            f.sh(&format!("git log -1 --format=%ae {ours}")),
+            f.sh(&format!("git log -1 --format=%ad --date=raw {ours}")),
+        );
+        let bogus = "0".repeat(40);
+        let pub_sha = f.sh(&format!(
+            "printf 'feat: two\n\nMonosplice-Source: {bogus}\n' | GIT_AUTHOR_EMAIL={ae} GIT_AUTHOR_DATE={} git commit-tree {tree}",
+            shq(&ad)
+        ));
+        f.sh(&format!(
+            "git push -q --force {} {pub_sha}:refs/heads/main",
+            f.remote_url()
+        ));
+
+        let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
+        assert_eq!(view.broken_source_refs.len(), 1, "{view:?}");
+        assert!(view.foreign_source_refs.is_empty());
+        assert!(view.related);
+    }
+
+    /// Standalone commits this monorepo imported are by construction not its exports, and a
+    /// claim naming a commit monosplice fetched from another standalone repository names that
+    /// repository's commit. Both are foreign whatever else the branch holds, and they show the
+    /// branch has another publisher — which is what lets a later unplaceable claim above our
+    /// own live export be read as that publisher's rather than as a broken mapping.
+    #[test]
+    fn imported_and_fetched_claims_are_foreign_and_reveal_another_publisher() {
+        let f = Fixture::new("other-publisher");
+        let tree = f.sh("git rev-parse HEAD:core");
+        let theirs = "1".repeat(40);
+        let published = f.push_pub(
+            &tree,
+            None,
+            &format!("their release\n\nMonosplice-Source: {theirs}\n"),
+        );
+        // A snapshot attach imports it: core/ already equals its tree.
+        let attach = f.commit(&format!("Adopt core\n\nMonosplice-Origin: {published}\n"));
+        f.sh("printf 'patch\n' > core/patch.txt");
+        let patch = f.commit("fix: our patch");
+        let patch_tree = f.sh("git rev-parse HEAD:core");
+        let exported = f.push_pub(
+            &patch_tree,
+            Some(&published),
+            &format!("fix: our patch\n\nMonosplice-Source: {patch}\n"),
+        );
+        let later = "2".repeat(40);
+        let upstream = f.push_pub(
+            &patch_tree,
+            Some(&exported),
+            &format!("their next release\n\nMonosplice-Source: {later}\n"),
+        );
+
+        let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
+        assert!(view.broken_source_refs.is_empty(), "{view:?}");
+        let foreign: Vec<&str> = view
+            .foreign_source_refs
+            .iter()
+            .map(|r| r.pub_sha.as_str())
+            .collect();
+        assert_eq!(foreign, vec![upstream.as_str(), published.as_str()]);
+        assert_eq!(view.last_exported_mono.as_deref(), Some(patch.as_str()));
+        assert_eq!(view.export_base.as_deref(), Some(patch.as_str()));
+        assert_ne!(view.export_base.as_deref(), Some(attach.as_str()));
+        assert_eq!(view.unreflected_pub, vec![upstream]);
+    }
+
+    /// A commit monosplice fetched from another standalone repository resolves here, but it is
+    /// that repository's commit: never an anchor, never a rewritten one.
+    #[test]
+    fn a_claim_naming_a_fetched_commit_of_another_repository_is_foreign() {
+        let f = Fixture::new("fetched-foreign");
+        let tree = f.sh("git rev-parse HEAD:core");
+        // Another repository's commit, present only under a monosplice tracking ref.
+        let blob = f.sh("printf 'middle\n' | git hash-object -w --stdin");
+        let middle_tree = f.sh(&format!(
+            "printf '100644 blob {blob}\\tmain.txt\\n' | git mktree"
+        ));
+        let middle = f.sh(&format!(
+            "printf 'middle: work\n' | git commit-tree {middle_tree}"
+        ));
+        f.sh(&format!(
+            "git update-ref refs/monosplice/middle/remote {middle}"
+        ));
+        let pub_sha = f.push_pub(
+            &tree,
+            None,
+            &format!("middle: work\n\nMonosplice-Source: {middle}\n"),
+        );
+
+        let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
+        assert_eq!(view.foreign_source_refs.len(), 1);
+        assert_eq!(view.foreign_source_refs[0].pub_sha, pub_sha);
+        assert_eq!(view.last_exported_mono, None, "not a rewritten anchor");
+        assert!(view.broken_source_refs.is_empty());
+        assert!(!view.related);
+    }
+
+    /// Only the last sync trailer of a commit is its own; the ones before it were forwarded
+    /// from an earlier hop and name some other repository's commits.
+    #[test]
+    fn forwarded_trailers_are_ignored_and_counted() {
+        let f = Fixture::new("forwarded");
+        let mono = f.sh("git rev-parse HEAD");
+        let tree = f.sh("git rev-parse HEAD:core");
+        let outer = "0".repeat(40);
+        let pub_sha = f.push_pub(
+            &tree,
+            None,
+            &format!("outer: patch\n\nMonosplice-Source: {outer}\nMonosplice-Source: {mono}\n"),
+        );
+        let leaf = "1".repeat(40);
+        f.commit(&format!(
+            "leaf: add b\n\nMonosplice-Origin: {leaf}\nMonosplice-Origin: {pub_sha}\n"
+        ));
+
+        let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
+        assert!(view.broken_source_refs.is_empty(), "{view:?}");
+        assert!(view.foreign_source_refs.is_empty());
+        assert_eq!(view.forwarded_source_trailers, 1);
+        assert_eq!(view.forwarded_origin_trailers, 1);
+        assert_eq!(view.last_exported_mono.as_deref(), Some(mono.as_str()));
+        assert!(!view.imported_pub_shas.contains(&leaf));
+        assert!(view.imported_pub_shas.contains(&pub_sha));
     }
 
     /// Validation stops at the newest trailer that resolves. Below that point a dead sha is a
@@ -829,36 +1217,6 @@ mod tests {
         assert_eq!(view.last_exported_mono.as_deref(), Some(mono.as_str()));
     }
 
-    /// Only the last sync trailer of a commit is its own; the ones before it were forwarded
-    /// from an earlier hop and name some other repository's commits.
-    #[test]
-    fn forwarded_trailers_are_ignored_and_counted() {
-        let f = Fixture::new("forwarded");
-        let mono = f.sh("git rev-parse HEAD");
-        let tree = f.sh("git rev-parse HEAD:core");
-        let outer = "0".repeat(40);
-        let pub_sha = f.push_pub(
-            &tree,
-            None,
-            &format!("outer: patch\n\nMonosplice-Source: {outer}\nMonosplice-Source: {mono}\n"),
-        );
-        let leaf = "1".repeat(40);
-        f.commit(&format!(
-            "leaf: add b\n\nMonosplice-Origin: {leaf}\nMonosplice-Origin: {pub_sha}\n"
-        ));
-
-        let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
-        assert!(view.broken_source_refs.is_empty(), "{view:?}");
-        assert_eq!(view.forwarded_source_trailers, 1);
-        assert_eq!(view.forwarded_origin_trailers, 1);
-        assert_eq!(view.last_exported_mono.as_deref(), Some(mono.as_str()));
-        assert!(!view.imported_pub_shas.contains(&leaf));
-        assert!(view.imported_pub_shas.contains(&pub_sha));
-    }
-
-    /// Validation stops at the newest trailer that resolves. Below that point a dead sha is a
-    /// fossil of somebody's rebase — no clone will ever have it, and it cannot change what is
-    /// published. Above it, the mapping is unreadable and the refusal stands.
     #[test]
     fn unreflected_pub_is_ancestry_based_not_per_commit() {
         let f = Fixture::new("unreflected");

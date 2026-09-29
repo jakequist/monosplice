@@ -902,8 +902,14 @@ mod tests {
         let s = f.subrepo();
         let tree = f.sh("git rev-parse HEAD:core");
         let bogus = "0".repeat(40);
+        // Published from here first: on a branch this monorepo has never exported to, a claim
+        // it cannot place is another monorepo's and not a broken mapping (sync_view tests).
+        let head = f.sh("git rev-parse HEAD");
+        let ours = f.sh(&format!(
+            "printf 'first commit\n\nMonosplice-Source: {head}\n' | git commit-tree {tree} "
+        ));
         let pub_sha = f.sh(&format!(
-            "printf 'export\n\nMonosplice-Source: {bogus}\n' | git commit-tree {tree} "
+            "printf 'export\n\nMonosplice-Source: {bogus}\n' | git commit-tree {tree} -p {ours}"
         ));
         f.sh(&format!(
             "git push -q {} {pub_sha}:refs/heads/main",

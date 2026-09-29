@@ -482,24 +482,53 @@ fn report_superseded_anchors(section: &mut Section, view: &SyncView) {
     );
 }
 
-/// `Monosplice-Source` trailers an earlier hop forwarded onto the standalone branch: monosplice
-/// 1.0.0 copied them, and only the last sync trailer on a commit is its claim. Push and pull
-/// ignore them, so they are information, never a problem.
+/// `Monosplice-Source` trailers on the standalone branch that are not this monorepo's: claims
+/// by another monorepo that publishes (or published) the same repository, and trailers an
+/// earlier hop forwarded. Push and pull ignore them, so they are information, never a problem.
 fn report_foreign_claims(section: &mut Section, view: &SyncView) {
+    let foreign = view.foreign_source_refs.len();
     let forwarded = view.forwarded_source_trailers;
-    if forwarded == 0 {
+    if foreign == 0 && forwarded == 0 {
         return;
     }
+    let mut parts = Vec::new();
+    if foreign > 0 {
+        parts.push(format!(
+            "{foreign} standalone commit(s) carry a {SOURCE_TRAILER} trailer written by another monorepo"
+        ));
+    }
+    if forwarded > 0 {
+        parts.push(format!(
+            "{forwarded} {SOURCE_TRAILER} trailer(s) were forwarded from an earlier hop"
+        ));
+    }
+    let newest = view.foreign_source_refs.first().map(|r| {
+        format!(
+            "Newest: standalone commit {} names {}.",
+            r.pub_sha, r.mono_sha
+        )
+    });
+    let mut detail: Vec<&str> = Vec::new();
+    if let Some(newest) = &newest {
+        detail.push(newest.as_str());
+        detail.push(
+            "Another monorepo publishes this repository too, or it is a vendored copy of one that does; those",
+        );
+        detail.push(
+            "trailers name that monorepo's commits, and pull imports the commits carrying them like any other work.",
+        );
+    }
+    if forwarded > 0 {
+        detail.push(
+            "A forwarded trailer was copied from an earlier hop by monosplice 1.0.0; only the last sync trailer",
+        );
+        detail.push("on a commit is that commit's claim.");
+    }
+    detail.push("None of them is part of this monorepo's commit mapping.");
     note(
         section,
-        format!(
-            "informational: {forwarded} {SOURCE_TRAILER} trailer(s) were forwarded from an earlier hop — ignored."
-        ),
-        &[
-            "A forwarded trailer was copied from an earlier hop by monosplice 1.0.0; only the last sync trailer",
-            "on a commit is that commit's claim.",
-            "None of them is part of this monorepo's commit mapping.",
-        ],
+        format!("informational: {} — ignored.", parts.join("; ")),
+        &detail,
     );
 }
 
