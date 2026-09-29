@@ -972,13 +972,12 @@ mod tests {
         assert_eq!(view.export_base, None);
     }
 
-    /// The shape of a vendored copy of a repository another monorepo publishes: every claim
-    /// names a commit this monorepo never had, and it has never exported here. Nothing of ours
-    /// can be missing from a branch we never published to, so the claims are that other
-    /// monorepo's — not a mapping, not a relationship, not an error.
+    /// A claim naming a commit this clone does not have, with nothing to say whose it is: no
+    /// `Monosplice-Monorepo` id, and this monorepo has no id of its own. It could be an export of
+    /// ours that this clone cannot see, so it is a broken mapping, exactly as in 1.0.0.
     #[test]
-    fn a_claim_on_a_branch_we_never_exported_to_is_foreign_not_broken() {
-        let f = Fixture::new("foreign-source");
+    fn a_pub_commit_naming_an_unknown_mono_sha_is_a_broken_source_ref() {
+        let f = Fixture::new("broken-source");
         let tree = f.sh("git rev-parse HEAD:core");
         let bogus = "0".repeat(40);
         let pub_sha = f.push_pub(
@@ -988,15 +987,18 @@ mod tests {
         );
 
         let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
-        assert!(view.broken_source_refs.is_empty());
-        assert_eq!(view.foreign_source_refs.len(), 1);
-        assert_eq!(view.foreign_source_refs[0].pub_sha, pub_sha);
-        assert_eq!(view.foreign_source_refs[0].mono_sha, bogus);
-        assert!(view.exported_mono_to_pub.is_empty());
+        assert_eq!(view.broken_source_refs.len(), 1);
+        assert_eq!(view.broken_source_refs[0].pub_sha, pub_sha);
+        assert_eq!(view.broken_source_refs[0].mono_sha, bogus);
+        // A broken claim never becomes the rewrite-detection cursor.
         assert_eq!(view.last_exported_mono, None);
-        // First contact, as for any repository nobody here has touched: `attach` decides.
-        assert!(!view.related);
-        assert_eq!(view.unreflected_pub, vec![pub_sha]);
+        // ...and it still counts as "related": pub is talking about us.
+        assert!(view.related);
+        // Nothing resolves anywhere, so nothing supersedes it either.
+        assert!(view.superseded_source_refs.is_empty());
+        assert!(view.foreign_source_refs.is_empty());
+        // Neither something to import nor something to skip silently.
+        assert!(view.unreflected_pub.is_empty());
     }
 
     /// The same branch seen from a shallow clone: a missing commit may simply be beyond the
