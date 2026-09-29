@@ -100,10 +100,29 @@ pub fn monosplice_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_monosplice"))
 }
 
-/// A released monosplice binary to cross-check against, from `MONOSPLICE_V1_BIN`. Tests that
-/// need one skip (and say so) when it is unset; CI does not install it.
+/// A released monosplice binary to cross-check against, from `MONOSPLICE_V1_BIN`. CI installs
+/// the 1.0.0 release asset on Linux and sets it.
+///
+/// Unset, the calling test skips — and says so where a person reads it: straight to the
+/// process's stderr, which the test harness does not capture (an `eprintln!` would only show
+/// on failure, so a skipped cross-check would pass looking exactly like a run one). Set
+/// `MONOSPLICE_REQUIRE_V1=1` to turn the skip into a failure.
 pub fn released_v1_bin() -> Option<PathBuf> {
-    let path = std::env::var_os("MONOSPLICE_V1_BIN")?;
+    let Some(path) = std::env::var_os("MONOSPLICE_V1_BIN") else {
+        let caller = std::thread::current()
+            .name()
+            .unwrap_or("a 1.0.0 cross-check")
+            .to_string();
+        assert!(
+            std::env::var_os("MONOSPLICE_REQUIRE_V1").is_none(),
+            "{caller}: MONOSPLICE_REQUIRE_V1 is set but MONOSPLICE_V1_BIN is not"
+        );
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED {caller}: set MONOSPLICE_V1_BIN to a monosplice 1.0.0 binary to run it"
+        );
+        return None;
+    };
     let path = PathBuf::from(path);
     assert!(
         path.is_file(),
@@ -491,6 +510,20 @@ pub fn write_config(repo: &TestRepo, entries: &[&str]) {
         .collect::<Vec<_>>()
         .join("\n\n");
     repo.write("monosplice.toml", &format!("{body}\n"));
+}
+
+/// [`write_config`] for a monorepo with an `id`: the line that names it in the trailers it
+/// writes on standalone repos, the way `monosplice init` starts every new config.
+pub fn write_config_with_id(repo: &TestRepo, id: &str, entries: &[&str]) {
+    let body = entries
+        .iter()
+        .map(|e| e.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    repo.write(
+        "monosplice.toml",
+        &format!("id = {}\n\n{body}\n", toml_str(id)),
+    );
 }
 
 pub struct Fixture {

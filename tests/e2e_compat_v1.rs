@@ -12,7 +12,8 @@
 //!   repository synced by this version exactly as it reads its own.
 //! - [`cross_checked_against_the_released_v1_binary`] re-derives those expectations live when
 //!   `MONOSPLICE_V1_BIN` names a 1.0.0 binary, and also hands each binary the other one's
-//!   history. It skips (loudly) when the variable is unset.
+//!   history. When the variable is unset it skips and prints `SKIPPED …` to the real stderr,
+//!   uncaptured, so the skip shows in every `cargo test` run; CI sets the variable on Linux.
 //!
 //! If the scenario changes, regenerate the constants with
 //! `MONOSPLICE_V1_BIN=/path/to/monosplice-1.0.0 cargo test --test e2e_compat_v1 -- --nocapture`,
@@ -385,7 +386,6 @@ fn single_hop_history_is_the_one_v1_wrote() {
 #[test]
 fn cross_checked_against_the_released_v1_binary() {
     let Some(v1) = released_v1_bin() else {
-        eprintln!("skipped: set MONOSPLICE_V1_BIN to a monosplice 1.0.0 binary to run this");
         return;
     };
 
@@ -515,7 +515,6 @@ fn the_export_of_a_conflicted_import_no_longer_forwards_its_origin() {
 #[test]
 fn a_conflicted_import_export_is_read_the_same_by_both_binaries() {
     let Some(v1) = released_v1_bin() else {
-        eprintln!("skipped: set MONOSPLICE_V1_BIN to a monosplice 1.0.0 binary to run this");
         return;
     };
 

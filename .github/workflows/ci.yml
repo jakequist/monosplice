@@ -26,6 +26,19 @@ jobs:
 
       - run: cargo clippy --all-targets -- -D warnings
 
+      # The 1.0.0 cross-checks (tests/e2e_compat_v1.rs) drive the released binary
+      # next to the one under test. Linux only: that is the one runner the
+      # x86_64 musl release asset runs on as is. Elsewhere they print SKIPPED.
+      - name: Install the monosplice 1.0.0 release for the cross-checks
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p "$RUNNER_TEMP/monosplice-v1"
+          curl -fsSL https://github.com/jakequist/monosplice/releases/download/v1.0.0/monosplice-1.0.0-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP/monosplice-v1"
+          "$RUNNER_TEMP/monosplice-v1/monosplice" --version | grep -qx 'monosplice 1.0.0'
+          echo "MONOSPLICE_V1_BIN=$RUNNER_TEMP/monosplice-v1/monosplice" >> "$GITHUB_ENV"
+          echo "MONOSPLICE_REQUIRE_V1=1" >> "$GITHUB_ENV"
+
       # The e2e suite shells out to system git (present on both runners) and
       # builds its own sandboxes, so it needs nothing else.
       - run: cargo test
