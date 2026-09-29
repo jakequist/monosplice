@@ -87,7 +87,40 @@ pub fn run_monosplice(cwd: &Path, args: &[&str]) -> RunResult {
 
 /// [`run_monosplice`] with extra environment on top of [`git_env`] (later wins).
 pub fn run_monosplice_env(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> RunResult {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_monosplice"));
+    run_binary_env(
+        Path::new(env!("CARGO_BIN_EXE_monosplice")),
+        cwd,
+        args,
+        extra_env,
+    )
+}
+
+/// The built binary under test.
+pub fn monosplice_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_monosplice"))
+}
+
+/// A released monosplice binary to cross-check against, from `MONOSPLICE_V1_BIN`. Tests that
+/// need one skip (and say so) when it is unset; CI does not install it.
+pub fn released_v1_bin() -> Option<PathBuf> {
+    let path = std::env::var_os("MONOSPLICE_V1_BIN")?;
+    let path = PathBuf::from(path);
+    assert!(
+        path.is_file(),
+        "MONOSPLICE_V1_BIN={} is not a file",
+        path.display()
+    );
+    Some(path)
+}
+
+/// [`run_monosplice_env`] for any monosplice binary — the one under test or a released one.
+pub fn run_binary_env(
+    bin: &Path,
+    cwd: &Path,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> RunResult {
+    let mut cmd = Command::new(bin);
     cmd.args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())

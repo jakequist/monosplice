@@ -89,6 +89,15 @@ subrepo, `core/` = the configured subrepo path.
 - [x] S85 `--json` output for `status` is stable and machine-parseable (locks the contract for CI use).
 - [x] S86 A `monosplice.toml` only configures the git repository it sits at the top of (`git rev-parse --show-toplevel` from the cwd). An outer monorepo that vendors another monosplice monorepo at `vendor/middle/` carries middle's `monosplice.toml` as ordinary content: every command run from `vendor/middle/` (or below it) refuses, exit ≠ 0, naming the skipped file, the repository it is not the top of, and the config that does apply there (or that there is none) — and writes nothing: no `refs/monosplice/*` in the outer repo, nothing pushed to middle's remotes. The same refusal when the nearest config is *above* the git top level (a parent directory, or the main checkout above a linked worktree whose branch has no config). Unchanged: running from the top level or any subdirectory of an ordinary monorepo, from a linked worktree, through a symlinked path, from a separate git repo nested inside another checkout (its own config applies), and outside any git repository (S80).
 
+## Chained monorepos (foreign trailers)
+
+> An **outer** monorepo vendors a **middle** monorepo that splices `lib/` out to a **leaf**
+> repo, or a monorepo vendors a repo another monorepo publishes. A trailer states a fact about
+> the one hop that wrote it; these scenarios keep every hop's trailers out of every other
+> hop's sync state. Tests: `tests/e2e_chained.rs`, `tests/e2e_compat_v1.rs`.
+
+- [x] S176 Compatibility with 1.0.0: an ordinary single-hop history driven by the binary under test (publish, export, import, vendor snapshot, vendor update, vendor patch back) produces byte-identical commits and the same `status --json` as 1.0.0 produced from the same steps (recorded shas, checked in CI); with `MONOSPLICE_V1_BIN` set the same is cross-checked live, and each binary carries on the other's history for another push/pull round and reports it in sync.
+
 ## First contact & adoption (auto-detection matrix)
 
 > The user never needs to know monosplice internals: outbound t=0 is a
