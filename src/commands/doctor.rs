@@ -427,11 +427,12 @@ fn check_subrepo(
         detail.push("rather than import past it or export over it.");
         if broken.unplaced == Some(Unplaced::NoId) {
             detail.push(
-                "If another monorepo publishes this repository, the monorepos that write to it need an `id`: a",
+                "If it is this monorepo's, fetch the commit it names into this clone. If it is another monorepo's,",
             );
             detail.push(
-                "monorepo whose config has had one from the start reads every id-less claim as somebody else's.",
+                "nothing here can show it: only a monorepo whose config has had an `id` since its first version",
             );
+            detail.push("reads an id-less claim as somebody else's.");
         }
         problem(
             &mut section,
