@@ -202,7 +202,11 @@ fn harness_selftest() {
 /// The `id = "…"` line of a config, if any.
 fn config_id(text: &str) -> Option<String> {
     text.lines().find_map(|l| {
-        let rest = l.trim().strip_prefix("id")?.trim_start().strip_prefix('=')?;
+        let rest = l
+            .trim()
+            .strip_prefix("id")?
+            .trim_start()
+            .strip_prefix('=')?;
         Some(rest.trim().trim_matches('"').to_string())
     })
 }

@@ -19,7 +19,7 @@ use crate::core::sync_view::{
     SyncViewOptions,
 };
 use crate::core::trailers::{
-    append_trailer, strip_sync_trailers, writer_trailer, SyncTrailer, SOURCE_TRAILER,
+    append_source_claim, strip_sync_trailers, writer_trailer, SyncTrailer, SOURCE_TRAILER,
 };
 
 #[derive(Debug, Clone)]
@@ -186,7 +186,11 @@ pub fn compute_exports(
         // Sync trailers already in the message belong to the hop that wrote them; forwarded,
         // they would read as claims about this standalone repo. `rewrite-message` runs first,
         // so a hook cannot put them back either.
-        message = append_trailer(&strip_sync_trailers(&message), SOURCE_TRAILER, &meta.sha);
+        message = append_source_claim(
+            &strip_sync_trailers(&message),
+            &meta.sha,
+            subrepo.monorepo_id.as_deref(),
+        );
 
         planned.push(PlannedExport {
             mono_sha: meta.sha.clone(),
@@ -510,10 +514,10 @@ pub fn publish_baseline(
         &CommitTreeInput {
             tree,
             parents: Vec::new(),
-            message: append_trailer(
+            message: append_source_claim(
                 &format!("Initial import of {}\n", subrepo.name),
-                SOURCE_TRAILER,
                 &meta.sha,
+                subrepo.monorepo_id.as_deref(),
             ),
             author_name: meta.committer_name.clone(),
             author_email: meta.committer_email.clone(),
@@ -631,6 +635,7 @@ mod tests {
                 rewrite_message: None,
                 transform: None,
                 scan: None,
+                monorepo_id: None,
             }
         }
 

@@ -216,6 +216,7 @@ mod tests {
             rewrite_message: None,
             transform: None,
             scan: None,
+            monorepo_id: None,
         }
     }
 
@@ -224,6 +225,7 @@ mod tests {
             root: PathBuf::from("/repo"),
             config_path: PathBuf::from("/repo/monosplice.toml"),
             subrepos: names.iter().map(|n| subrepo(n)).collect(),
+            id: None,
         }
     }
 

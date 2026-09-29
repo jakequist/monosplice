@@ -12,6 +12,10 @@
 
 pub const SOURCE_TRAILER: &str = "Monosplice-Source";
 pub const ORIGIN_TRAILER: &str = "Monosplice-Origin";
+/// Written right after an export's `Monosplice-Source` when the monorepo has an `id`: which
+/// monorepo made the claim. It is what lets a standalone branch that two monorepos publish say
+/// whose export each commit is, instead of leaving it to be guessed.
+pub const MONOREPO_TRAILER: &str = "Monosplice-Monorepo";
 
 /// A trailer line: `^[A-Za-z0-9-]+:\s.+$` — a key, a colon, one whitespace character,
 /// then at least one more character that is not a line break.
@@ -193,6 +197,16 @@ pub fn writer_trailer(message: &str) -> Option<SyncTrailer> {
         return None;
     }
     last.split('\n').filter_map(SyncTrailer::parse).next_back()
+}
+
+/// An export's claim: `Monosplice-Source: <mono sha>`, then `Monosplice-Monorepo: <id>` when the
+/// monorepo has an id. Without one the message is exactly what 1.0.0 wrote.
+pub fn append_source_claim(message: &str, mono_sha: &str, monorepo_id: Option<&str>) -> String {
+    let claimed = append_trailer(message, SOURCE_TRAILER, mono_sha);
+    match monorepo_id {
+        Some(id) => append_trailer(&claimed, MONOREPO_TRAILER, id),
+        None => claimed,
+    }
 }
 
 /// Append a trailer to a commit message, extending an existing trailer block if
@@ -400,6 +414,23 @@ mod tests {
         );
         assert_eq!(SyncTrailer::parse("Signed-off-by: x"), None);
         assert_eq!(SyncTrailer::parse("Monosplice-Source: "), None);
+    }
+
+    #[test]
+    fn a_source_claim_carries_the_monorepo_id_only_when_there_is_one() {
+        assert_eq!(
+            append_source_claim("feat: x", "abc", None),
+            "feat: x\n\nMonosplice-Source: abc\n"
+        );
+        assert_eq!(
+            append_source_claim("feat: x\n\nSigned-off-by: A <a@b.c>\n", "abc", Some("m-1")),
+            "feat: x\n\nSigned-off-by: A <a@b.c>\nMonosplice-Source: abc\nMonosplice-Monorepo: m-1\n"
+        );
+        // The claim is still the last *sync* trailer of the commit.
+        assert_eq!(
+            writer_trailer(&append_source_claim("feat: x", "abc", Some("m-1"))),
+            Some(SyncTrailer::Source("abc".to_string()))
+        );
     }
 
     #[test]

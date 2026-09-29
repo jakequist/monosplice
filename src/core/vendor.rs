@@ -506,6 +506,7 @@ mod tests {
             rewrite_message: None,
             transform: None,
             scan: None,
+            monorepo_id: None,
         }
     }
 
@@ -544,6 +545,7 @@ mod tests {
             root: dir.path().to_path_buf(),
             config_path,
             subrepos,
+            id: None,
         }
     }
 
@@ -887,6 +889,7 @@ mod tests {
             root: dir.path().to_path_buf(),
             config_path: config_path.clone(),
             subrepos: resolve_config(original, &config_path).unwrap(),
+            id: None,
         };
         let victim = project.subrepos[0].clone();
 

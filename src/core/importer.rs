@@ -567,6 +567,7 @@ mod tests {
             rewrite_message: None,
             transform: None,
             scan: None,
+            monorepo_id: None,
         }
     }
 

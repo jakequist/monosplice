@@ -346,7 +346,7 @@ Nothing was changed. Configured subrepos: {}",
     };
     let retry = format!("monosplice attach {folder} {url}");
 
-    let entry = plan(folder, url, args)?;
+    let entry = plan(folder, url, args, project.id.clone())?;
     if let Some(taken) = check_free_slot(
         &project.subrepos,
         &VendorEntry::from(&entry),
@@ -401,7 +401,12 @@ Nothing was changed — the config is untouched and no commit was made. Drop --i
 }
 
 /// Turn the folder and the URL into the subrepo entry the rest of monosplice understands.
-fn plan(folder: &str, url: &str, args: &AttachArgs) -> Result<ResolvedSubrepo, Failure> {
+fn plan(
+    folder: &str,
+    url: &str,
+    args: &AttachArgs,
+    monorepo_id: Option<String>,
+) -> Result<ResolvedSubrepo, Failure> {
     if args.fork.as_deref() == Some(url) {
         return Err(Failure::error(format!(
             "--fork {url} is the same URL you are attaching, so there is no fork to push to.\nNothing was changed. Drop --fork, or point it at your own fork of {url}."
@@ -428,6 +433,7 @@ fn plan(folder: &str, url: &str, args: &AttachArgs) -> Result<ResolvedSubrepo, F
         rewrite_message: None,
         transform: None,
         scan: None,
+        monorepo_id,
     })
 }
 
@@ -752,6 +758,7 @@ mod tests {
             rewrite_message: None,
             transform: None,
             scan: None,
+            monorepo_id: None,
         }
     }
 
@@ -760,6 +767,7 @@ mod tests {
             root: PathBuf::from("/repo"),
             config_path: PathBuf::from("/repo/monosplice.toml"),
             subrepos: vec![subrepo("core", "core"), subrepo("lib", "packages/lib")],
+            id: None,
         }
     }
 
@@ -800,6 +808,7 @@ mod tests {
             "./vendor/lodash/",
             "u",
             &args("./vendor/lodash/", Some("u")),
+            None,
         )
         .unwrap();
         assert_eq!(entry.name, "lodash");
@@ -817,7 +826,7 @@ mod tests {
         a.fork = Some("fork".to_string());
         a.branch = Some("4.x".to_string());
         a.name = Some("ld".to_string());
-        let entry = plan("vendor/lodash", "up", &a).unwrap();
+        let entry = plan("vendor/lodash", "up", &a, None).unwrap();
         assert_eq!(entry.name, "ld");
         assert_eq!(entry.remote, "fork");
         assert_eq!(entry.upstream.as_deref(), Some("up"));
@@ -829,7 +838,7 @@ mod tests {
     fn a_fork_equal_to_the_attached_url_is_refused_before_anything_else() {
         let mut a = args("vendor/lodash", Some("u"));
         a.fork = Some("u".to_string());
-        let err = plan("vendor/lodash", "u", &a).expect_err("no fork to push to");
+        let err = plan("vendor/lodash", "u", &a, None).expect_err("no fork to push to");
         assert!(err
             .message
             .starts_with("--fork u is the same URL you are attaching"));
@@ -838,7 +847,8 @@ mod tests {
 
     #[test]
     fn a_path_outside_the_monorepo_names_what_to_do_instead() {
-        let err = plan("..", "u", &args("..", Some("u"))).expect_err("not a directory inside");
+        let err =
+            plan("..", "u", &args("..", Some("u")), None).expect_err("not a directory inside");
         assert!(err
             .message
             .ends_with("\nNothing was changed. Name a directory inside this monorepo."));

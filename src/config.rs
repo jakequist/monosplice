@@ -40,6 +40,10 @@ pub struct ResolvedSubrepo {
     pub rewrite_message: Option<String>,
     pub transform: Option<String>,
     pub scan: Option<String>,
+    /// The monorepo's top-level `id`, the same on every subrepo of one config. Written after
+    /// every `Monosplice-Source` this monorepo exports, so a standalone branch that another
+    /// monorepo also publishes says whose claim is whose.
+    pub monorepo_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +52,8 @@ pub struct Project {
     pub root: PathBuf,
     pub config_path: PathBuf,
     pub subrepos: Vec<ResolvedSubrepo>,
+    /// The config's top-level `id` (also on every entry as `monorepo_id`).
+    pub id: Option<String>,
 }
 
 /// A config monosplice will not act on. The message is the whole user-facing text.
@@ -95,8 +101,30 @@ struct RawSubrepo {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    id: Option<String>,
     #[serde(default)]
     subrepos: Vec<RawSubrepo>,
+}
+
+/// Longest `id` accepted: room for a UUID or a readable name, never a paragraph.
+pub const MAX_ID_LEN: usize = 64;
+
+/// Can this string be a monorepo `id`? It is written as a trailer value on public commits and
+/// compared byte for byte, so it is one token of letters, digits, `.`, `_` and `-`.
+pub fn is_valid_monorepo_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_ID_LEN
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// The `id` of a config's text, or `None` when it has none or cannot be read as TOML at all.
+/// Lenient on purpose: this reads *past* versions of the file from history, which may predate
+/// keys the current schema requires or forbids; only the `id` matters here.
+pub fn monorepo_id_of(raw: &str) -> Option<String> {
+    let value: toml::Value = toml::from_str(raw).ok()?;
+    value.get("id")?.as_str().map(str::to_string)
 }
 
 fn indent(text: &str) -> String {
@@ -200,6 +228,13 @@ pub fn resolve_config(raw: &str, config_path: &Path) -> Result<Vec<ResolvedSubre
     // Empty strings are a config typo, not a value; serde cannot see them, so they are
     // collected here and reported together the way zod reported its issue list.
     let mut issues: Vec<String> = Vec::new();
+    if let Some(id) = &parsed.id {
+        if !is_valid_monorepo_id(id) {
+            issues.push(format!(
+                "  id — {id:?} is not a valid monorepo id: use 1 to {MAX_ID_LEN} letters, digits, `.`, `_` or `-` (it is written on every exported commit as `Monosplice-Monorepo: <id>`)"
+            ));
+        }
+    }
     for (idx, s) in parsed.subrepos.iter().enumerate() {
         let mut require = |field: &str, value: &str| {
             if value.is_empty() {
@@ -270,6 +305,7 @@ pub fn resolve_config(raw: &str, config_path: &Path) -> Result<Vec<ResolvedSubre
             rewrite_message: s.rewrite_message,
             transform: s.transform,
             scan: s.scan,
+            monorepo_id: parsed.id.clone(),
         });
     }
 
@@ -324,6 +360,7 @@ pub fn load_project(start_dir: &Path) -> Result<Option<Project>, ConfigError> {
         }
     };
     let subrepos = resolve_config(&raw, &config_path)?;
+    let id = monorepo_id_of(&raw);
     Ok(Some(Project {
         root: config_path
             .parent()
@@ -331,6 +368,7 @@ pub fn load_project(start_dir: &Path) -> Result<Option<Project>, ConfigError> {
             .unwrap_or_else(|| PathBuf::from(".")),
         config_path,
         subrepos,
+        id,
     }))
 }
 
@@ -672,5 +710,43 @@ mod tests {
     fn rejects_an_empty_upstream() {
         let message = err("[[subrepos]]\npath = \"core\"\nremote = \"fork\"\nupstream = \"\"\n");
         assert!(message.contains("upstream"), "{message}");
+    }
+
+    #[test]
+    fn an_id_is_carried_on_every_entry() {
+        let s = resolve_config(
+            "id = \"mono-1.a_b\"\n\n[[subrepos]]\npath = \"core\"\nremote = \"r\"\n\n[[subrepos]]\npath = \"lib\"\nremote = \"l\"\n",
+            Path::new(CONFIG_PATH),
+        )
+        .unwrap();
+        assert!(s
+            .iter()
+            .all(|e| e.monorepo_id.as_deref() == Some("mono-1.a_b")));
+        let none = resolve_config(
+            "[[subrepos]]\npath = \"core\"\nremote = \"r\"\n",
+            Path::new(CONFIG_PATH),
+        )
+        .unwrap();
+        assert_eq!(none[0].monorepo_id, None);
+    }
+
+    #[test]
+    fn rejects_an_id_that_cannot_be_one_trailer_value() {
+        for bad in ["", "two words", "new\\nline", "semi;colon"] {
+            let message = err(&format!("id = \"{bad}\"\n"));
+            assert!(message.contains("  id — "), "{bad}: {message}");
+        }
+        let long = "x".repeat(MAX_ID_LEN + 1);
+        assert!(err(&format!("id = \"{long}\"\n")).contains("  id — "));
+    }
+
+    #[test]
+    fn an_id_is_read_leniently_from_any_version_of_the_file() {
+        assert_eq!(
+            monorepo_id_of("id = \"x\"\nunknown = 1\n").as_deref(),
+            Some("x")
+        );
+        assert_eq!(monorepo_id_of("[[subrepos]]\npath = \"a\"\n"), None);
+        assert_eq!(monorepo_id_of("not toml ["), None);
     }
 }
