@@ -388,7 +388,19 @@ fn s178_a_contributors_source_line_is_ordinary_work_and_changes_nothing_else() {
 
 #[test]
 fn s179_two_publishers_import_each_others_exports() {
-    let p = publisher(Some(P_ID));
+    two_publishers(Some(P_ID));
+}
+
+/// The owner's arrangement: production was set up by 1.0.0 and has no id; the second publisher
+/// was created by `init` and has one. Production needs nothing but this binary: an id it never
+/// had is somebody else's.
+#[test]
+fn s179_a_publisher_without_an_id_imports_a_second_publishers_export() {
+    two_publishers(None);
+}
+
+fn two_publishers(p_id: Option<&str>) {
+    let p = publisher(p_id);
     let k = p.consumer("kacho", Some(K_ID));
     k.commit(
         "kacho: fix lib",
@@ -415,7 +427,8 @@ fn s179_two_publishers_import_each_others_exports() {
         .commit("prod: change", &[("lib/b.txt", Some("p2\n"))]);
     run_ok(&p.mono.dir, &["push"]);
     assert_eq!(trailer(&p.lib, "main", SOURCE), vec![p.mono.head()]);
-    assert_eq!(trailer(&p.lib, "main", MONOREPO), vec![P_ID.to_string()]);
+    let p_ids: Vec<String> = p_id.into_iter().map(str::to_string).collect();
+    assert_eq!(trailer(&p.lib, "main", MONOREPO), p_ids);
     run_ok(&p.mono.dir, &["doctor"]);
 
     run_ok(&k.dir, &["pull"]);
