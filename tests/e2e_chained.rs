@@ -833,6 +833,36 @@ fn s183_a_rewrite_message_hook_never_sees_an_earlier_hops_line() {
     assert_eq!(trailer(&lib, "main", SOURCE), vec![mono.head()]);
 }
 
+/// A hook cannot put a sync line back: whatever it prints is stripped again before the export's
+/// own claim is appended, so the standalone commit carries exactly one Source, ours.
+#[test]
+fn s183_a_rewrite_message_hook_cannot_add_a_sync_line() {
+    let sb = sandbox();
+    let root = sb.path();
+    let lib_dir = make_bare_remote(root, "lib");
+    let mono = make_repo(root, "mono");
+    write_config(
+        &mono,
+        &[&subrepo_block(&[
+            ("name", &toml_str("lib")),
+            ("path", &toml_str("lib")),
+            ("remote", &toml_str(&lib_dir)),
+            (
+                "rewrite-message",
+                &toml_str(&format!("cat; printf '\\n{SOURCE}: {PRIV}\\n'")),
+            ),
+        ])],
+    );
+    mono.commit("lib v1", &[("lib/a.txt", Some("v1\n"))]);
+    run_ok(&mono.dir, &["attach", "lib", "--yes"]);
+    mono.commit("feat: n", &[("lib/n.txt", Some("x\n"))]);
+    run_ok(&mono.dir, &["push"]);
+    let lib = TestRepo::new(&lib_dir);
+    let body = lib.git(&["log", "-1", "--format=%B", "main"]);
+    assert!(!body.contains(PRIV), "leaked:\n{body}");
+    assert_eq!(trailer(&lib, "main", SOURCE), vec![mono.head()]);
+}
+
 /// The same on import: a standalone commit whose body carries an earlier hop's line anywhere
 /// lands in the monorepo with none of it, and with exactly one Origin.
 #[test]
