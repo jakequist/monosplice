@@ -148,6 +148,53 @@ pub fn strip_sync_trailers(message: &str) -> String {
     format!("{head}\n\n{}\n", kept.join("\n"))
 }
 
+/// Which of monosplice's sync trailers a commit carries as its *own*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncTrailer {
+    Source(String),
+    Origin(String),
+}
+
+impl SyncTrailer {
+    /// Parse one `Key: value` line as git's `%(trailers)` prints it. Anything that is not a
+    /// sync trailer, or has no value, is `None`.
+    pub fn parse(line: &str) -> Option<SyncTrailer> {
+        let idx = line.find(':')?;
+        let key = trim_js(&line[..idx]);
+        let value = trim_js(&line[idx + 1..]).to_string();
+        if value.is_empty() {
+            return None;
+        }
+        if key.eq_ignore_ascii_case(SOURCE_TRAILER) {
+            Some(SyncTrailer::Source(value))
+        } else if key.eq_ignore_ascii_case(ORIGIN_TRAILER) {
+            Some(SyncTrailer::Origin(value))
+        } else {
+            None
+        }
+    }
+}
+
+/// The sync trailer the hop that created this commit wrote: the *last* `Monosplice-Source` or
+/// `Monosplice-Origin` in the final trailer block.
+///
+/// Every replay appends its own trailer after whatever the message already carried, so when a
+/// message holds more than one, the earlier ones were forwarded from a previous hop (monosplice
+/// 1.0.0 copied them verbatim) and describe some other repository's boundary. Only the last is
+/// this commit's claim. Published history cannot be rewritten, so this is how commits that
+/// already carry forwarded trailers stay readable.
+pub fn writer_trailer(message: &str) -> Option<SyncTrailer> {
+    let blocks = paragraphs(message);
+    if blocks.len() < 2 {
+        return None;
+    }
+    let last = blocks.last()?;
+    if !is_trailer_block(last) {
+        return None;
+    }
+    last.split('\n').filter_map(SyncTrailer::parse).next_back()
+}
+
 /// Append a trailer to a commit message, extending an existing trailer block if
 /// the message ends with one, otherwise starting a new block.
 pub fn append_trailer(message: &str, key: &str, value: &str) -> String {
@@ -321,6 +368,38 @@ mod tests {
         let doubled = "leaf: add b\n\nMonosplice-Origin: leaf\nMonosplice-Origin: middle\n";
         let out = append_trailer(&strip_sync_trailers(doubled), ORIGIN_TRAILER, "outer");
         assert_eq!(out, "leaf: add b\n\nMonosplice-Origin: outer\n");
+    }
+
+    #[test]
+    fn the_writer_trailer_is_the_last_sync_trailer() {
+        assert_eq!(writer_trailer("s"), None);
+        assert_eq!(writer_trailer("s\n\nSigned-off-by: A <a@b.c>\n"), None);
+        assert_eq!(
+            writer_trailer("s\n\nMonosplice-Origin: l\nMonosplice-Origin: m\n"),
+            Some(SyncTrailer::Origin("m".to_string()))
+        );
+        assert_eq!(
+            writer_trailer(
+                "s\n\nMonosplice-Origin: u\nMonosplice-Source: x\nSigned-off-by: A <a@b.c>\n"
+            ),
+            Some(SyncTrailer::Source("x".to_string()))
+        );
+        // The same prose rule as get_trailer: not a trailer block, no claim.
+        assert_eq!(writer_trailer("s\n\nMonosplice-Origin: u\nprose\n"), None);
+    }
+
+    #[test]
+    fn sync_trailer_lines_parse_case_insensitively() {
+        assert_eq!(
+            SyncTrailer::parse("monosplice-source: abc"),
+            Some(SyncTrailer::Source("abc".to_string()))
+        );
+        assert_eq!(
+            SyncTrailer::parse("Monosplice-Origin:  def "),
+            Some(SyncTrailer::Origin("def".to_string()))
+        );
+        assert_eq!(SyncTrailer::parse("Signed-off-by: x"), None);
+        assert_eq!(SyncTrailer::parse("Monosplice-Source: "), None);
     }
 
     #[test]

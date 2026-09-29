@@ -125,6 +125,7 @@ pub fn run(args: &DoctorArgs) -> Result<(), Failure> {
     let mut origin_by_mono: HashMap<String, Vec<String>> = HashMap::new();
     let mut live_anchors: Vec<String> = Vec::new();
     let mut every_subrepo_anchored = true;
+    let mut forwarded_origins = 0usize;
 
     for subrepo in &subrepos {
         let (section, checked) = check_subrepo(&root, subrepo)?;
@@ -142,6 +143,7 @@ pub fn run(args: &DoctorArgs) -> Result<(), Failure> {
         // are all equal — the TypeScript did exactly this, for exactly that reason.
         imported_pub_shas = checked.view.imported_pub_shas;
         origin_by_mono = checked.view.origin_by_mono;
+        forwarded_origins = checked.view.forwarded_origin_trailers;
         match checked.live_anchor {
             Some(anchor) => live_anchors.push(anchor),
             None => every_subrepo_anchored = false,
@@ -162,7 +164,7 @@ pub fn run(args: &DoctorArgs) -> Result<(), Failure> {
 
     // Only meaningful with every subrepo in view: a Monosplice-Origin trailer in monorepo
     // history may belong to any of the configured remotes.
-    let (orphans, fossils) = if args.subrepo.is_some() {
+    let (orphans, mut fossils) = if args.subrepo.is_some() {
         (Vec::new(), Vec::new())
     } else {
         classify_origins(
@@ -173,6 +175,9 @@ pub fn run(args: &DoctorArgs) -> Result<(), Failure> {
             settled,
         )
     };
+    if forwarded_origins > 0 && args.subrepo.is_none() {
+        fossils.push(forwarded_origin_note(forwarded_origins));
+    }
 
     let problems = usize::from(pull_in_progress.is_some())
         + sections.iter().map(|s| s.row.problems.len()).sum::<usize>()
@@ -428,6 +433,7 @@ fn check_subrepo(
     }
 
     report_superseded_anchors(&mut section, &view);
+    report_foreign_claims(&mut section, &view);
 
     if export_base_rewritten(root, &view) {
         report_rewritten_anchor(&mut section, root, subrepo, &view);
@@ -473,6 +479,27 @@ fn report_superseded_anchors(section: &mut Section, view: &SyncView) {
             view.superseded_source_refs.len()
         ),
         &detail,
+    );
+}
+
+/// `Monosplice-Source` trailers an earlier hop forwarded onto the standalone branch: monosplice
+/// 1.0.0 copied them, and only the last sync trailer on a commit is its claim. Push and pull
+/// ignore them, so they are information, never a problem.
+fn report_foreign_claims(section: &mut Section, view: &SyncView) {
+    let forwarded = view.forwarded_source_trailers;
+    if forwarded == 0 {
+        return;
+    }
+    note(
+        section,
+        format!(
+            "informational: {forwarded} {SOURCE_TRAILER} trailer(s) were forwarded from an earlier hop — ignored."
+        ),
+        &[
+            "A forwarded trailer was copied from an earlier hop by monosplice 1.0.0; only the last sync trailer",
+            "on a commit is that commit's claim.",
+            "None of them is part of this monorepo's commit mapping.",
+        ],
     );
 }
 
@@ -632,6 +659,23 @@ fn verify_mapping(section: &mut Section, root: &Path, subrepo: &ResolvedSubrepo,
             "standalone branch was probably rewritten.",
         ],
     );
+}
+
+/// Monorepo commits carrying more than one sync trailer: an import or replay by monosplice 1.0.0
+/// copied the standalone commit's own trailers ahead of the one it wrote. Only the last is the
+/// commit's claim; the rest name commits of other repositories and are ignored.
+fn forwarded_origin_note(count: usize) -> Finding {
+    Finding {
+        headline: format!(
+            "informational: {count} {ORIGIN_TRAILER} trailer(s) in monorepo history were forwarded from an earlier hop — ignored."
+        ),
+        detail: vec![
+            "An earlier monosplice copied the imported commit's own trailers ahead of the one it wrote. Only the"
+                .to_string(),
+            "last sync trailer on a commit is that commit's claim; the others name commits of other repositories."
+                .to_string(),
+        ],
+    }
 }
 
 /// The oldest of the live anchors, which is the one every settled fossil sits below and so the

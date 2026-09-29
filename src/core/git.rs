@@ -9,6 +9,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use crate::core::trailers::{SyncTrailer, ORIGIN_TRAILER, SOURCE_TRAILER};
+
 /// SHA of git's canonical empty tree object.
 pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
@@ -227,20 +229,17 @@ fn mktree_input(lines: &[String]) -> String {
     s
 }
 
-fn parse_trailer_values(out: &str) -> HashMap<String, Vec<String>> {
-    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+fn parse_sync_trailers(out: &str) -> HashMap<String, Vec<SyncTrailer>> {
+    let mut map: HashMap<String, Vec<SyncTrailer>> = HashMap::new();
     if out.is_empty() {
         return map;
     }
     for line in out.split('\n') {
         let mut fields = line.split('\0');
         let sha = fields.next().unwrap_or("");
-        let vals: Vec<String> = fields
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .collect();
-        if !sha.is_empty() && !vals.is_empty() {
-            map.insert(sha.to_string(), vals);
+        let trailers: Vec<SyncTrailer> = fields.filter_map(SyncTrailer::parse).collect();
+        if !sha.is_empty() && !trailers.is_empty() {
+            map.insert(sha.to_string(), trailers);
         }
     }
     map
@@ -505,18 +504,22 @@ pub fn read_blob(cwd: &Path, sha: &str) -> Result<Vec<u8>, GitError> {
     git_buffer(cwd, &["cat-file", "blob", sha], GitOpts::default())
 }
 
-/// Map of commit sha -> trailer values for every commit in the given rev range
-/// that has at least one value for the trailer key. `rev_args` example: ["HEAD"] or ["A..B"].
-pub fn trailer_values(
+/// Every commit in the given rev range that carries at least one monosplice sync trailer,
+/// mapped to those trailers *in message order*. The order matters: the last one is the claim of
+/// the hop that wrote the commit ([`crate::core::trailers::writer_trailer`] has the rule), and
+/// any before it were forwarded from an earlier hop. Parsed by git itself, as it always was, so
+/// what counts as a trailer block does not change. `rev_args` example: ["HEAD"] or ["A..B"].
+pub fn sync_trailers(
     cwd: &Path,
-    key: &str,
     rev_args: &[&str],
-) -> Result<HashMap<String, Vec<String>>, GitError> {
-    let format = format!("--format=%H%x00%(trailers:key={key},valueonly,separator=%x00)");
+) -> Result<HashMap<String, Vec<SyncTrailer>>, GitError> {
+    let format = format!(
+        "--format=%H%x00%(trailers:key={SOURCE_TRAILER},key={ORIGIN_TRAILER},separator=%x00)"
+    );
     let mut args: Vec<&str> = vec!["log", &format];
     args.extend_from_slice(rev_args);
     let out = git(cwd, &args)?;
-    Ok(parse_trailer_values(&out))
+    Ok(parse_sync_trailers(&out))
 }
 
 /// Resolve a branch head on a remote. Returns the sha, None if the branch (or an
@@ -820,18 +823,24 @@ mod tests {
     }
 
     #[test]
-    fn parses_trailer_values_dropping_commits_without_any() {
-        let out = "aaa\0mono1\nbbb\0\nccc\0mono2\0 mono3 \nddd\0\0";
-        let map = parse_trailer_values(out);
-        assert_eq!(map.get("aaa"), Some(&vec!["mono1".to_string()]));
+    fn parses_sync_trailers_in_order_dropping_commits_without_any() {
+        let out = "aaa\0Monosplice-Source: mono1\nbbb\0\nccc\0Monosplice-Origin: l1\0monosplice-origin:  m1 \nddd\0\0";
+        let map = parse_sync_trailers(out);
+        assert_eq!(
+            map.get("aaa"),
+            Some(&vec![SyncTrailer::Source("mono1".to_string())])
+        );
         assert_eq!(map.get("bbb"), None);
         assert_eq!(
             map.get("ccc"),
-            Some(&vec!["mono2".to_string(), "mono3".to_string()])
+            Some(&vec![
+                SyncTrailer::Origin("l1".to_string()),
+                SyncTrailer::Origin("m1".to_string())
+            ])
         );
         assert_eq!(map.get("ddd"), None);
         assert_eq!(map.len(), 2);
-        assert!(parse_trailer_values("").is_empty());
+        assert!(parse_sync_trailers("").is_empty());
     }
 
     #[test]
@@ -927,9 +936,12 @@ Monosplice-Source: deadbeef
             .starts_with("first\n\nMonosplice-Source: deadbeef"));
         assert!(meta.author_date.contains(' '));
 
-        let tv = trailer_values(d, "Monosplice-Source", &["HEAD"]).unwrap();
+        let tv = sync_trailers(d, &["HEAD"]).unwrap();
         assert_eq!(tv.len(), 1);
-        assert_eq!(tv.get(&commits[1]).unwrap(), &vec!["deadbeef".to_string()]);
+        assert_eq!(
+            tv.get(&commits[1]).unwrap(),
+            &vec![SyncTrailer::Source("deadbeef".to_string())]
+        );
 
         let entries = ls_tree_recursive(d, "HEAD").unwrap();
         assert_eq!(entries.len(), 2);

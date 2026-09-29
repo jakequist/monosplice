@@ -19,7 +19,7 @@ use crate::core::sync_view::{
     SyncViewOptions,
 };
 use crate::core::trailers::{
-    append_trailer, get_trailer, strip_sync_trailers, ORIGIN_TRAILER, SOURCE_TRAILER,
+    append_trailer, strip_sync_trailers, writer_trailer, SyncTrailer, SOURCE_TRAILER,
 };
 
 #[derive(Debug, Clone)]
@@ -130,7 +130,9 @@ pub fn plan_export(
 /// tip has moved on — otherwise a long-settled import becomes a candidate again and
 /// republishes an old state on top of newer public work.
 fn already_published(root: &Path, message: &str, tree: &str, pub_head: &str) -> bool {
-    let Some(origin) = get_trailer(message, ORIGIN_TRAILER) else {
+    // The commit's own claim: an Origin forwarded from an earlier hop names a commit of some
+    // other repository.
+    let Some(SyncTrailer::Origin(origin)) = writer_trailer(message) else {
         return false;
     };
     if origin.is_empty() {

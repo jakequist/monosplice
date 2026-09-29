@@ -11,9 +11,9 @@ use crate::config::ResolvedSubrepo;
 use crate::core::filter::anchor_subtree;
 use crate::core::git::{
     existing_commits, fetch_branch, git, git_with, ls_remote_branch, missing_objects, rev_list,
-    rev_parse, trailer_values, GitError, GitOpts,
+    rev_parse, sync_trailers, GitError, GitOpts,
 };
-use crate::core::trailers::{ORIGIN_TRAILER, SOURCE_TRAILER};
+use crate::core::trailers::SyncTrailer;
 
 /// Where a subrepo's public branch is mirrored inside the monorepo's object db.
 pub fn remote_tracking_ref(name: &str) -> String {
@@ -127,6 +127,11 @@ pub struct SyncView {
     /// has, that anchor decides what is published and the dead trailers below it can no longer
     /// change the answer — they are reported and never refused.
     pub superseded_source_refs: Vec<BrokenSourceRef>,
+    /// `Monosplice-Source` trailers on the standalone branch that are not the last sync trailer
+    /// of their commit: forwarded from an earlier hop (monosplice 1.0.0 copied them). Ignored.
+    pub forwarded_source_trailers: usize,
+    /// The same for `Monosplice-Origin` trailers in monorepo history. Ignored.
+    pub forwarded_origin_trailers: usize,
     /// Do the two repos know about each other at all? False means first contact: the public
     /// branch has history, but nothing on either side references the other, so the only safe
     /// move is `monosplice attach`.
@@ -146,6 +151,8 @@ pub fn unpublished_view(name: &str) -> SyncView {
         unreflected_pub: Vec::new(),
         broken_source_refs: Vec::new(),
         superseded_source_refs: Vec::new(),
+        forwarded_source_trailers: 0,
+        forwarded_origin_trailers: 0,
         related: false,
     }
 }
@@ -281,6 +288,34 @@ fn find_unreflected_pub(
         .collect())
 }
 
+/// Split each commit's sync trailers into the claim of the hop that wrote it — the last one —
+/// and the forwarded rest. Returns commit -> claim value for claims of the wanted kind, plus
+/// how many trailers of that kind were forwarded.
+fn writer_claims(
+    trailers: &HashMap<String, Vec<SyncTrailer>>,
+    want_source: bool,
+) -> (HashMap<String, String>, usize) {
+    let mut claims = HashMap::new();
+    let mut forwarded = 0;
+    for (sha, list) in trailers {
+        let is_wanted = |t: &SyncTrailer| matches!(t, SyncTrailer::Source(_)) == want_source;
+        let Some((last, earlier)) = list.split_last() else {
+            continue;
+        };
+        forwarded += earlier.iter().filter(|t| is_wanted(t)).count();
+        match last {
+            SyncTrailer::Source(v) if want_source => {
+                claims.insert(sha.clone(), v.clone());
+            }
+            SyncTrailer::Origin(v) if !want_source => {
+                claims.insert(sha.clone(), v.clone());
+            }
+            _ => {}
+        }
+    }
+    (claims, forwarded)
+}
+
 /// Derive every sync cursor from trailers. There is no state file: this runs on each
 /// invocation. `ls_remote_branch` goes first so an unreachable remote fails with a GitError
 /// carrying git's own stderr, and a missing branch is reported as "not published yet" rather
@@ -298,17 +333,19 @@ pub fn load_sync_view(
         ls_remote_branch(root, source, &s.branch)?
     };
 
-    let origin_by_mono = if rev_parse(root, "HEAD").is_some() {
-        trailer_values(root, ORIGIN_TRAILER, &["HEAD"])?
+    // Only the last sync trailer on a commit is the claim of the hop that wrote it; any before
+    // it were forwarded from an earlier hop and name some other repository's commits.
+    let mono_trailers = if rev_parse(root, "HEAD").is_some() {
+        sync_trailers(root, &["HEAD"])?
     } else {
         HashMap::new()
     };
-    let mut imported_pub_shas: HashSet<String> = HashSet::new();
-    for values in origin_by_mono.values() {
-        for v in values {
-            imported_pub_shas.insert(v.clone());
-        }
-    }
+    let (writer_origins, forwarded_origin_trailers) = writer_claims(&mono_trailers, false);
+    let origin_by_mono: HashMap<String, Vec<String>> = writer_origins
+        .into_iter()
+        .map(|(mono_sha, pub_sha)| (mono_sha, vec![pub_sha]))
+        .collect();
+    let imported_pub_shas: HashSet<String> = origin_by_mono.values().flatten().cloned().collect();
 
     let Some(pub_head) = pub_head else {
         if opts.offline {
@@ -319,6 +356,7 @@ pub fn load_sync_view(
         return Ok(SyncView {
             imported_pub_shas,
             origin_by_mono,
+            forwarded_origin_trailers,
             ..unpublished_view(&s.name)
         });
     };
@@ -327,7 +365,12 @@ pub fn load_sync_view(
         fetch_branch(root, source, &s.branch, &tracking_ref)?;
     }
 
-    let source_by_pub = trailer_values(root, SOURCE_TRAILER, &[&tracking_ref])?;
+    let (writer_sources, forwarded_source_trailers) =
+        writer_claims(&sync_trailers(root, &[&tracking_ref])?, true);
+    let source_by_pub: HashMap<String, Vec<String>> = writer_sources
+        .into_iter()
+        .map(|(pub_sha, mono_sha)| (pub_sha, vec![mono_sha]))
+        .collect();
 
     // The pub walk drives both the mapping and the broken-ref scan. Newest first, so the
     // newest public commit claiming a monorepo commit is the one the mapping records — the
@@ -402,6 +445,8 @@ pub fn load_sync_view(
         unreflected_pub,
         broken_source_refs,
         superseded_source_refs,
+        forwarded_source_trailers,
+        forwarded_origin_trailers,
         related,
     })
 }
@@ -784,6 +829,36 @@ mod tests {
         assert_eq!(view.last_exported_mono.as_deref(), Some(mono.as_str()));
     }
 
+    /// Only the last sync trailer of a commit is its own; the ones before it were forwarded
+    /// from an earlier hop and name some other repository's commits.
+    #[test]
+    fn forwarded_trailers_are_ignored_and_counted() {
+        let f = Fixture::new("forwarded");
+        let mono = f.sh("git rev-parse HEAD");
+        let tree = f.sh("git rev-parse HEAD:core");
+        let outer = "0".repeat(40);
+        let pub_sha = f.push_pub(
+            &tree,
+            None,
+            &format!("outer: patch\n\nMonosplice-Source: {outer}\nMonosplice-Source: {mono}\n"),
+        );
+        let leaf = "1".repeat(40);
+        f.commit(&format!(
+            "leaf: add b\n\nMonosplice-Origin: {leaf}\nMonosplice-Origin: {pub_sha}\n"
+        ));
+
+        let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
+        assert!(view.broken_source_refs.is_empty(), "{view:?}");
+        assert_eq!(view.forwarded_source_trailers, 1);
+        assert_eq!(view.forwarded_origin_trailers, 1);
+        assert_eq!(view.last_exported_mono.as_deref(), Some(mono.as_str()));
+        assert!(!view.imported_pub_shas.contains(&leaf));
+        assert!(view.imported_pub_shas.contains(&pub_sha));
+    }
+
+    /// Validation stops at the newest trailer that resolves. Below that point a dead sha is a
+    /// fossil of somebody's rebase — no clone will ever have it, and it cannot change what is
+    /// published. Above it, the mapping is unreadable and the refusal stands.
     #[test]
     fn unreflected_pub_is_ancestry_based_not_per_commit() {
         let f = Fixture::new("unreflected");
