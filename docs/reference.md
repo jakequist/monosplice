@@ -719,6 +719,10 @@ git commit -am "release: vX.Y.Z"
 git tag vX.Y.Z && git push origin main vX.Y.Z
 ```
 
+Between releases, `main` carries the *next* version with a `-dev` suffix (`1.1.0-dev` after
+`1.0.0`), in both files, so a build from source never reports itself as a release; the release
+commit drops the suffix.
+
 `.github/workflows/release.yml` then refuses the tag if it disagrees with `Cargo.toml`, runs
 the full suite, and cross-builds the five release targets. Each build is packed as
 `monosplice-X.Y.Z-<target>.tar.gz` containing one `monosplice` binary; all five, plus
