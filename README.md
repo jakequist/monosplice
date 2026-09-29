@@ -154,7 +154,10 @@ No magic, no daemon, no lock-in.
 **Two histories, one mapping.** The monorepo and each standalone repo have independent
 histories; monosplice replays commits between them and records the correspondence in commit
 trailers (the `Key: value` lines git keeps at the end of a commit message) — exports carry
-`Monosplice-Source: <monorepo-sha>`, imports carry `Monosplice-Origin: <standalone-sha>`. Each
+`Monosplice-Source: <monorepo-sha>`, imports carry `Monosplice-Origin: <standalone-sha>`, and a
+trailer only ever describes the one hop that wrote it — a replay never forwards them, and a
+claim naming another monorepo's commit (a repo you vendor that somebody else publishes) is not
+mistaken for yours ([chains of monorepos](docs/reference.md#chains-of-monorepos-whose-trailer-is-it)). Each
 export is built with git plumbing (`ls-tree`, `mktree`, `commit-tree`) and preserves the
 original author and dates. The remote ref is written exactly once — after every commit and
 every hook has succeeded. Commits that touch nothing exportable produce no commit on the
@@ -261,7 +264,12 @@ Things monosplice won't do, listed here so you don't find out the hard way:
   `Monosplice-Source: <monorepo-sha>` trailer. That trailer *is* the sync mapping, so
   `rewrite-message` runs before it is appended and cannot strip it — private-monorepo SHAs
   appear in standalone-repo history, permanently. They reveal nothing but 40 hex characters,
-  but know it's there before you publish.
+  but know it's there before you publish. They go one hop and no further: a commit replayed
+  onward carries only the trailer of the hop that replayed it.
+- **One publisher per standalone branch, as far as `push` can tell.** If a second monorepo
+  exports straight onto a branch you publish, your `push` stops at its first commit there,
+  because a `Monosplice-Source` it cannot resolve could be an export of yours it cannot see.
+  Vendoring a repo that another monorepo publishes, and pushing patches back to it, works.
 - **No shallow clones.** Sync state is re-derived by walking history, so a shallow monorepo
   clone stops with an error rather than guessing.
 - **`status` talks to the network by default.** Re-deriving state is a couple of `git log`

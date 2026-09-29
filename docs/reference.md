@@ -202,6 +202,62 @@ prints the entry for you to paste in yourself, naming the `monosplice attach <fo
 finishes the job once you have. And `attach` refuses to start unless the working tree is
 clean, because it commits the index.
 
+## Chains of monorepos: whose trailer is it?
+
+A repository monosplice publishes can itself be vendored by another monosplice monorepo — or
+be one: an outer monorepo that vendors a middle monorepo, which splices `lib/` out to a leaf
+repo. Every hop records its own mapping in trailers, and a trailer only ever describes the one
+boundary it was written at. Three rules keep the hops apart:
+
+- **A replay never forwards sync trailers.** When `push` exports a commit or `pull` imports
+  one, any `Monosplice-Source` / `Monosplice-Origin` lines already in its message are removed
+  and the one trailer for *this* hop is appended. So a patch the outer monorepo pushes into
+  middle, and middle then publishes to the leaf, reaches the leaf carrying only middle's
+  `Monosplice-Source` — the outer monorepo's private sha stops at middle. Other trailers
+  (`Signed-off-by`, `Co-authored-by`, …) are kept. A commit that carries no sync trailer is
+  replayed byte-for-byte as before. The earlier hop's sha is not preserved under another
+  name: each hop's trailer names the commit one hop back, which is enough to follow the chain,
+  and forwarding it would publish a private monorepo's shas further than the monorepo that
+  owns them decided to.
+- **Only the last sync trailer on a commit is its claim.** monosplice 1.0.0 did forward them,
+  and published history cannot be rewritten, so a commit may carry `Source: <outer sha>`
+  followed by `Source: <middle sha>`, or two `Monosplice-Origin` lines. The last one was
+  written by the hop that made the commit; the ones before it were forwarded and are ignored.
+- **A `Monosplice-Source` claim is this monorepo's only if it can be.** It counts when it
+  names a commit on your `HEAD`'s history, or a commit your clone has that `HEAD` no longer
+  reaches (a rewrite — rewrite detection and anchor recovery handle it exactly as before). It
+  is *another monorepo's* when it names a commit monosplice fetched from a different
+  standalone repository (under `refs/monosplice/`), or when it sits on a standalone commit you
+  imported — nobody imports their own export.
+
+A claim naming a commit your clone does not have at all is the case that needs care, because
+monosplice never guesses:
+
+| Where the unresolvable claim sits (first row that applies) | Read as |
+| --- | --- |
+| Below the newest claim of yours that resolves | history — it cannot change what is published (a note in `doctor`) |
+| In a **shallow clone** | possibly yours: `push` refuses, as always — `git fetch --unshallow` |
+| On a commit authored like one of yours (same author email, author time and subject — an export copies them, a rebase or `filter-repo` keeps them) | possibly yours: `push` refuses |
+| On a branch you have never exported to | another monorepo's — a vendored copy of something somebody else publishes |
+| On a branch you export to, which has already shown another publisher | another monorepo's |
+| On a branch you export to where nobody else has published | possibly yours: `push` refuses (a broken mapping) |
+
+Another monorepo's claims are simply not part of your mapping: `pull` imports the commits that
+carry them like any other standalone work, they never count as your exports or anchors, and
+`doctor` mentions them as information (`informational: N standalone commit(s) carry a
+Monosplice-Source trailer written by another monorepo — ignored.`) without failing.
+
+The last row is deliberate and is the one limit: when a repository you publish receives an
+export from a second monorepo — say a consumer that vendors it pushes a patch straight to the
+branch you publish from — your `push` stops at that commit exactly as 1.0.0 did, because from
+your clone it is indistinguishable from an export of yours whose history you cannot see.
+
+Nothing needs migrating. Histories written by 1.0.0 read exactly as before, forwarded trailers
+included. A single-hop repo synced from now on is byte-for-byte what 1.0.0 would have written,
+with one exception: the export of a *conflicted* import no longer repeats that import's
+`Monosplice-Origin` line above its own `Monosplice-Source`. 1.0.0 never read that line, so it
+still reads every repository this version writes.
+
 ## Configuration
 
 `monosplice.toml` sits at the root of your monorepo — that is what `monosplice init` writes.
@@ -311,7 +367,9 @@ the object database is written.
 `rewrite-message` is the odd one out: it shapes the commit, not the tree, so it runs from the
 monorepo root with the original message on **stdin** and the rewritten message expected on
 **stdout**. It runs *before* the `Monosplice-Source` trailer is appended, so you cannot
-accidentally strip it.
+accidentally strip it — and any `Monosplice-Source` / `Monosplice-Origin` lines still in its
+output are removed first, so it cannot add one either (see
+[whose trailer is it?](#chains-of-monorepos-whose-trailer-is-it)).
 
 Worked examples, one of each:
 
@@ -558,7 +616,9 @@ always go to stderr, so either can be piped straight into `jq`. The JSON keys ar
 the TypeScript releases — a pipeline built on them keeps working. Findings are split the same
 way everywhere: `problems` is what fails the run, `notes` is informational and never changes an
 exit code — including `monorepo.notes`, where settled history (a superseded anchor, an import
-trailer from a remote the subrepo no longer tracks) is reported without failing anything.
+trailer from a remote the subrepo no longer tracks, a trailer an earlier hop forwarded) is
+reported without failing anything, and a subrepo's `notes`, where another monorepo's
+`Monosplice-Source` claims on its standalone branch are.
 
 ```sh
 monosplice status --check              # 0 = converged, 1 = drift
