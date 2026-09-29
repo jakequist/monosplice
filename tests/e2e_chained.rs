@@ -221,3 +221,136 @@ fn s170_an_import_history_replay_carries_only_its_own_origins() {
         doctor.stdout
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// S171: histories 1.0.0 already published with forwarded trailers keep working as they are.
+// ---------------------------------------------------------------------------------------------
+
+/// The chain of tests/fixtures/v1.0.0-chain, written by monosplice 1.0.0 (see generate.sh there):
+/// relative remotes, so restoring the bundles side by side is all it takes.
+struct Legacy {
+    _sb: Sandbox,
+    leaf: TestRepo,
+    mw: TestRepo,
+    outer: TestRepo,
+    outer5: TestRepo,
+}
+
+fn legacy_chain() -> Legacy {
+    let sb = sandbox();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1.0.0-chain");
+    let restore = |name: &str, dest: &str, bare: bool| {
+        let bundle = fixtures.join(format!("{name}.bundle"));
+        let dest = sb.path().join(dest);
+        let mut args = vec!["clone", "-q", "-b", "main"];
+        if bare {
+            args.push("--bare");
+        }
+        let bundle = bundle.to_string_lossy().into_owned();
+        let dest_str = dest.to_string_lossy().into_owned();
+        args.push(&bundle);
+        args.push(&dest_str);
+        TestRepo::new(sb.path()).git(&args);
+        // A clone from a bundle remembers the bundle as `origin`; nothing here uses it.
+        TestRepo::new(&dest)
+    };
+    let leaf = restore("leaf", "leaf.git", true);
+    restore("middle", "middle.git", true);
+    let mw = restore("mw", "mw", false);
+    let outer = restore("outer", "outer", false);
+    let outer5 = restore("outer5", "outer5", false);
+    Legacy {
+        _sb: sb,
+        leaf,
+        mw,
+        outer,
+        outer5,
+    }
+}
+
+/// Bug 2's aftermath: the leaf's tip carries outer's `Monosplice-Source` ahead of middle's.
+/// 1.0.0 read outer's sha as middle's broken mapping and refused every later push.
+#[test]
+fn s171_a_published_doubled_source_trailer_does_not_brick_the_middle() {
+    let l = legacy_chain();
+    let doubled = trailer(&l.leaf, "main", SOURCE);
+    assert_eq!(doubled.len(), 2, "fixture: {doubled:?}");
+    assert_eq!(doubled[1], l.mw.head(), "fixture: middle's own is last");
+
+    let doctor = run_ok(&l.mw.dir, &["doctor"]);
+    assert!(
+        doctor.stdout.contains("all checks passed"),
+        "{}",
+        doctor.stdout
+    );
+    assert!(
+        doctor
+            .stdout
+            .contains("1 Monosplice-Source trailer(s) were forwarded"),
+        "{}",
+        doctor.stdout
+    );
+    assert!(run_ok(&l.mw.dir, &["status"]).stdout.contains("in sync"));
+    assert!(run_ok(&l.mw.dir, &["pull", "--dry-run"])
+        .stdout
+        .contains("up to date"));
+
+    l.mw.commit(
+        "middle: after the upgrade",
+        &[("lib/a.txt", Some("lib v1\nouter patch\nmiddle again\n"))],
+    );
+    run_ok(&l.mw.dir, &["push", "lib"]);
+    assert_eq!(trailer(&l.leaf, "main", SOURCE), vec![l.mw.head()]);
+    assert_eq!(
+        l.leaf.tree_sha("main", None),
+        l.mw.tree_sha("HEAD", Some("lib"))
+    );
+}
+
+/// Bug 3's aftermath: an outer import carries the leaf's sha ahead of middle's. 1.0.0's
+/// `doctor` reported the leaf sha as an import no configured remote has.
+#[test]
+fn s171_a_published_doubled_origin_trailer_is_not_an_orphaned_import() {
+    let l = legacy_chain();
+    let doubled = trailer(&l.outer, "HEAD~1", ORIGIN);
+    assert_eq!(doubled.len(), 2, "fixture: {doubled:?}");
+
+    let doctor = run_ok(&l.outer.dir, &["doctor"]);
+    assert!(
+        doctor.stdout.contains("all checks passed"),
+        "{}",
+        doctor.stdout
+    );
+    assert!(
+        doctor
+            .stdout
+            .contains("1 Monosplice-Origin trailer(s) in monorepo history were forwarded"),
+        "{}",
+        doctor.stdout
+    );
+    let status = run_ok(&l.outer.dir, &["status"]);
+    assert!(status.stdout.contains("in sync"), "{}", status.stdout);
+}
+
+/// Bug 5's aftermath: an `--import-history` replay by 1.0.0 carries the same doubled Origin.
+/// Only the last one is the replayed commit's claim, so the leaf sha ahead of it is not an
+/// import this monorepo made — and not an orphan no configured remote has.
+#[test]
+fn s171_a_published_doubled_origin_from_an_import_history_replay() {
+    let l = legacy_chain();
+    let doubled = trailer(&l.outer5, "HEAD", ORIGIN);
+    assert_eq!(doubled.len(), 2, "fixture: {doubled:?}");
+
+    let json = run_monosplice(&l.outer5.dir, &["doctor", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&json.stdout).expect("json");
+    assert_eq!(
+        report["monorepo"]["problems"],
+        serde_json::json!([]),
+        "{}",
+        json.stdout
+    );
+    assert_eq!(
+        report["monorepo"]["notes"][0],
+        "informational: 1 Monosplice-Origin trailer(s) in monorepo history were forwarded from an earlier hop — ignored."
+    );
+}
