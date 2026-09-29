@@ -13,7 +13,7 @@ use crate::config::ResolvedSubrepo;
 use crate::core::exporter::{build_export_chain, compute_exports, plan_export, PlannedExport};
 use crate::core::importer::read_sequencer;
 use crate::core::sync_view::{load_sync_view, try_load_fork_state, SyncViewError, SyncViewOptions};
-use crate::ops::{git_message, unreachable_source};
+use crate::ops::{git_message, unplaced_status, unreachable_source};
 use crate::report::{require_project, select_subrepos, warn, Failure, NO_SUBREPOS_CONFIGURED};
 
 /// One row of the `--json` contract (S85). Field order is the key order `JSON.stringify`
@@ -54,6 +54,8 @@ struct Note {
     unreachable: Option<String>,
     /// `--offline` and this subrepo has never been fetched, so there is nothing to measure.
     no_fetch_yet: bool,
+    /// A claim this monorepo cannot place: the line to print instead of the counts.
+    unplaced: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -219,12 +221,19 @@ fn inspect(
     }
 
     let behind = view.unreflected_pub.len();
+    let unplaced = unplaced_status(subrepo, &view);
+    let in_sync = ahead == 0 && behind == 0 && unplaced.is_none();
+    if unplaced.is_some() {
+        let mut stopped = note.unwrap_or_default();
+        stopped.unplaced = unplaced;
+        note = Some(stopped);
+    }
     Ok((
         SubrepoStatus {
             seeded: true,
             ahead: Some(ahead),
             behind: Some(behind),
-            in_sync: ahead == 0 && behind == 0,
+            in_sync,
             hook_error,
             ..unmeasured()
         },
@@ -270,6 +279,8 @@ fn inspect_fork(
 fn describe(row: &SubrepoStatus, note: Option<&Note>) {
     if note.is_some_and(|note| note.no_fetch_yet) {
         println!("{}: no fetch yet — run without --offline first", row.name);
+    } else if let Some(unplaced) = note.and_then(|note| note.unplaced.as_deref()) {
+        println!("{unplaced}");
     } else if !row.seeded {
         println!(
             "{}: not published yet (run `monosplice push {} --yes`)",

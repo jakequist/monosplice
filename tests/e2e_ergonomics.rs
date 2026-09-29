@@ -852,15 +852,18 @@ fn s165_init_writes_a_monosplice_toml_that_loads_as_an_empty_config() {
     assert!(res.stdout.contains(CONFIG), "got:\n{}", res.stdout);
 
     let written = mono.read(CONFIG);
-    // Every meaningful line is commented out, which is what "loads as an empty config" looks
-    // like from outside: nothing is attached until `attach` appends the first entry.
+    // Every meaningful line but the monorepo's `id` (S184) is commented out, which is what
+    // "loads as an empty config" looks like from outside: nothing is attached until `attach`
+    // appends the first entry.
     for line in written.lines() {
         let trimmed = line.trim();
         assert!(
-            trimmed.is_empty() || trimmed.starts_with('#'),
+            trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("id = \""),
             "the scaffold configures nothing yet, but this line does: {line}"
         );
     }
+    let status = run_monosplice(&mono.dir, &["status"]);
+    assert_eq!(status.exit_code, 0, "stderr: {}", status.stderr);
     assert!(
         written.contains("[[subrepos]]"),
         "the scaffold must show the entry shape, got:\n{written}"

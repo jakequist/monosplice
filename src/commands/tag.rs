@@ -10,7 +10,9 @@ use crate::config::ResolvedSubrepo;
 use crate::core::exporter::{compute_exports, plan_export};
 use crate::core::git::{git, push_ref};
 use crate::core::sync_view::{SyncView, SyncViewOptions};
-use crate::ops::{git_stderr, load_view, nothing_exists_yet, require_published, short};
+use crate::ops::{
+    git_stderr, load_view, nothing_exists_yet, require_published, short, unplaced_claim,
+};
 use crate::report::{require_project, select_subrepos, Failure};
 
 #[derive(clap::Args, Debug)]
@@ -114,6 +116,13 @@ Run `monosplice push {}` first, then tag again.",
 }
 
 fn require_nothing_to_pull(subrepo: &ResolvedSubrepo, view: &SyncView) -> Result<(), Failure> {
+    if let Some(broken) = view.broken_source_refs.first() {
+        return Err(Failure::error(unplaced_claim(
+            subrepo,
+            broken,
+            "No tag was created.",
+        )));
+    }
     if view.unreflected_pub.is_empty() {
         return Ok(());
     }

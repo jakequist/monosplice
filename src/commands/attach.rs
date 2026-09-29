@@ -196,7 +196,10 @@ Nothing was changed. Drop --branch, or change `branch` in {config_path}.",
     let Some(pub_head) = view.pub_head.clone() else {
         return publish_configured(root, entry, has_content, args);
     };
-    if view.related {
+    // Related only through claims nobody can place is not "already connected": this may well be
+    // first contact, and the snapshot below is exactly what settles those claims — the same move
+    // `attach <folder> <url>` has always made on such a repository.
+    if view.related && !view.unplaced_only {
         return Err(Failure::error(format!(
             "{}: already connected to {source} — monosplice trailers already link the two repositories, so there is nothing to attach.
 Nothing was changed. Run `monosplice pull {}` to import new standalone-repo commits, `monosplice push {}` to export new monorepo commits, or `monosplice sync {}` for both.",

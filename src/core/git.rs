@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use crate::core::trailers::{SyncTrailer, ORIGIN_TRAILER, SOURCE_TRAILER};
+use crate::core::trailers::{TrailerLine, MONOREPO_TRAILER, ORIGIN_TRAILER, SOURCE_TRAILER};
 
 /// SHA of git's canonical empty tree object.
 pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -96,7 +96,7 @@ fn stdin_list(shas: &[String]) -> String {
 
 /// Split git output into lines the way the TS did: empty output means no lines at all
 /// (a bare `split('\n')` would yield one empty string).
-fn split_lines(out: &str) -> Vec<String> {
+pub fn split_lines(out: &str) -> Vec<String> {
     if out.is_empty() {
         Vec::new()
     } else {
@@ -229,15 +229,15 @@ fn mktree_input(lines: &[String]) -> String {
     s
 }
 
-fn parse_sync_trailers(out: &str) -> HashMap<String, Vec<SyncTrailer>> {
-    let mut map: HashMap<String, Vec<SyncTrailer>> = HashMap::new();
+fn parse_sync_trailers(out: &str) -> HashMap<String, Vec<TrailerLine>> {
+    let mut map: HashMap<String, Vec<TrailerLine>> = HashMap::new();
     if out.is_empty() {
         return map;
     }
     for line in out.split('\n') {
         let mut fields = line.split('\0');
         let sha = fields.next().unwrap_or("");
-        let trailers: Vec<SyncTrailer> = fields.filter_map(SyncTrailer::parse).collect();
+        let trailers: Vec<TrailerLine> = fields.filter_map(TrailerLine::parse).collect();
         if !sha.is_empty() && !trailers.is_empty() {
             map.insert(sha.to_string(), trailers);
         }
@@ -512,14 +512,96 @@ pub fn read_blob(cwd: &Path, sha: &str) -> Result<Vec<u8>, GitError> {
 pub fn sync_trailers(
     cwd: &Path,
     rev_args: &[&str],
-) -> Result<HashMap<String, Vec<SyncTrailer>>, GitError> {
+) -> Result<HashMap<String, Vec<TrailerLine>>, GitError> {
     let format = format!(
-        "--format=%H%x00%(trailers:key={SOURCE_TRAILER},key={ORIGIN_TRAILER},separator=%x00)"
+        "--format=%H%x00%(trailers:key={SOURCE_TRAILER},key={ORIGIN_TRAILER},key={MONOREPO_TRAILER},separator=%x00)"
     );
     let mut args: Vec<&str> = vec!["log", &format];
     args.extend_from_slice(rev_args);
     let out = git(cwd, &args)?;
     Ok(parse_sync_trailers(&out))
+}
+
+/// Every commit reachable from `rev`, newest first in topological order (a commit always before
+/// its parents), with its parents.
+pub fn rev_list_with_parents(
+    cwd: &Path,
+    rev: &str,
+) -> Result<Vec<(String, Vec<String>)>, GitError> {
+    let out = git(cwd, &["rev-list", "--topo-order", "--parents", rev])?;
+    Ok(split_lines(&out)
+        .into_iter()
+        .filter_map(|line| {
+            let mut shas = line.split(' ').map(str::to_string);
+            let sha = shas.next().filter(|s| !s.is_empty())?;
+            Some((sha, shas.collect()))
+        })
+        .collect())
+}
+
+/// Every version a file has had on `rev`'s history: the blob ids on either side of each change
+/// to it, merges included (`-m`), so a version that lived only on a merged side branch counts.
+pub fn file_versions(cwd: &Path, rev: &str, path: &str) -> Result<Vec<String>, GitError> {
+    let out = git(
+        cwd,
+        &[
+            "log",
+            "--full-history",
+            "-m",
+            "--no-renames",
+            "--raw",
+            "--no-abbrev",
+            "--format=",
+            rev,
+            "--",
+            path,
+        ],
+    )?;
+    let mut blobs: Vec<String> = Vec::new();
+    for line in out.lines().filter(|l| l.starts_with(':')) {
+        for oid in line.split_whitespace().skip(2).take(2) {
+            if !oid.chars().all(|c| c == '0') && !blobs.iter().any(|b| b == oid) {
+                blobs.push(oid.to_string());
+            }
+        }
+    }
+    Ok(blobs)
+}
+
+/// The content of each blob, in one `cat-file --batch`; `None` for one that is not here.
+pub fn read_blobs(cwd: &Path, oids: &[String]) -> Result<Vec<Option<Vec<u8>>>, GitError> {
+    if oids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let input = stdin_list(oids);
+    let out = git_buffer(
+        cwd,
+        &["cat-file", "--batch"],
+        GitOpts {
+            input: Some(input.as_bytes()),
+            ..Default::default()
+        },
+    )?;
+    let mut blobs = Vec::with_capacity(oids.len());
+    let mut rest: &[u8] = &out;
+    for _ in oids {
+        let Some(eol) = rest.iter().position(|b| *b == b'\n') else {
+            break;
+        };
+        let header = String::from_utf8_lossy(&rest[..eol]).into_owned();
+        rest = &rest[eol + 1..];
+        let mut fields = header.split(' ');
+        let (_, kind, size) = (fields.next(), fields.next(), fields.next());
+        match (kind, size.and_then(|s| s.parse::<usize>().ok())) {
+            (Some(_), Some(size)) if size < rest.len() => {
+                blobs.push(Some(rest[..size].to_vec()));
+                // The content is followed by one newline.
+                rest = &rest[size + 1..];
+            }
+            _ => blobs.push(None),
+        }
+    }
+    Ok(blobs)
 }
 
 /// Is this clone shallow? Commits beyond the shallow boundary are missing without having been
@@ -652,6 +734,7 @@ pub fn probe_push_access(cwd: &Path, remote: &str, sha: &str, branch: &str) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::trailers::SyncTrailer;
 
     #[test]
     fn strips_exactly_one_trailing_newline() {
@@ -830,18 +913,21 @@ mod tests {
 
     #[test]
     fn parses_sync_trailers_in_order_dropping_commits_without_any() {
-        let out = "aaa\0Monosplice-Source: mono1\nbbb\0\nccc\0Monosplice-Origin: l1\0monosplice-origin:  m1 \nddd\0\0";
+        let out = "aaa\0Monosplice-Source: mono1\0Monosplice-Monorepo: m-1\nbbb\0\nccc\0Monosplice-Origin: l1\0monosplice-origin:  m1 \nddd\0\0";
         let map = parse_sync_trailers(out);
         assert_eq!(
             map.get("aaa"),
-            Some(&vec![SyncTrailer::Source("mono1".to_string())])
+            Some(&vec![
+                TrailerLine::Sync(SyncTrailer::Source("mono1".to_string())),
+                TrailerLine::Monorepo("m-1".to_string())
+            ])
         );
         assert_eq!(map.get("bbb"), None);
         assert_eq!(
             map.get("ccc"),
             Some(&vec![
-                SyncTrailer::Origin("l1".to_string()),
-                SyncTrailer::Origin("m1".to_string())
+                TrailerLine::Sync(SyncTrailer::Origin("l1".to_string())),
+                TrailerLine::Sync(SyncTrailer::Origin("m1".to_string()))
             ])
         );
         assert_eq!(map.get("ddd"), None);
@@ -871,6 +957,7 @@ mod tests {
 #[cfg(test)]
 mod smoke {
     use super::*;
+    use crate::core::trailers::SyncTrailer;
     use std::path::PathBuf;
 
     fn sh(cwd: &Path, cmd: &str) -> String {
@@ -946,7 +1033,9 @@ Monosplice-Source: deadbeef
         assert_eq!(tv.len(), 1);
         assert_eq!(
             tv.get(&commits[1]).unwrap(),
-            &vec![SyncTrailer::Source("deadbeef".to_string())]
+            &vec![TrailerLine::Sync(SyncTrailer::Source(
+                "deadbeef".to_string()
+            ))]
         );
         assert!(!is_shallow(d));
 

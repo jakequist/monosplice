@@ -113,7 +113,9 @@ fn is_sync_trailer_line(line: &str) -> bool {
         return false;
     };
     let key = line[..idx].trim_end_matches(is_space);
-    key.eq_ignore_ascii_case(SOURCE_TRAILER) || key.eq_ignore_ascii_case(ORIGIN_TRAILER)
+    key.eq_ignore_ascii_case(SOURCE_TRAILER)
+        || key.eq_ignore_ascii_case(ORIGIN_TRAILER)
+        || key.eq_ignore_ascii_case(MONOREPO_TRAILER)
 }
 
 /// Remove every `Monosplice-Source` / `Monosplice-Origin` line from the final paragraph of a
@@ -177,6 +179,62 @@ impl SyncTrailer {
             None
         }
     }
+}
+
+/// One line of `%(trailers)` output that monosplice reads: a sync trailer, or the id line that
+/// names the monorepo which wrote the claim before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrailerLine {
+    Sync(SyncTrailer),
+    Monorepo(String),
+}
+
+impl TrailerLine {
+    pub fn parse(line: &str) -> Option<TrailerLine> {
+        if let Some(sync) = SyncTrailer::parse(line) {
+            return Some(TrailerLine::Sync(sync));
+        }
+        let idx = line.find(':')?;
+        let value = trim_js(&line[idx + 1..]);
+        if trim_js(&line[..idx]).eq_ignore_ascii_case(MONOREPO_TRAILER) && !value.is_empty() {
+            return Some(TrailerLine::Monorepo(value.to_string()));
+        }
+        None
+    }
+}
+
+/// A commit's own claim: the last sync trailer on it, plus the `Monosplice-Monorepo` id written
+/// *after* that trailer, if any. An id line before it belongs to a trailer an earlier hop wrote
+/// (1.0.0 forwarded both), so it says nothing about this one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterClaim {
+    pub trailer: SyncTrailer,
+    pub monorepo: Option<String>,
+    /// Sync trailers of the same kind ahead of the claim: forwarded from an earlier hop.
+    pub forwarded: usize,
+}
+
+pub fn writer_claim(lines: &[TrailerLine]) -> Option<WriterClaim> {
+    let last = lines
+        .iter()
+        .rposition(|l| matches!(l, TrailerLine::Sync(_)))?;
+    let TrailerLine::Sync(trailer) = &lines[last] else {
+        return None;
+    };
+    let is_source = matches!(trailer, SyncTrailer::Source(_));
+    let forwarded = lines[..last]
+        .iter()
+        .filter(|l| matches!(l, TrailerLine::Sync(t) if matches!(t, SyncTrailer::Source(_)) == is_source))
+        .count();
+    let monorepo = lines[last + 1..].iter().find_map(|l| match l {
+        TrailerLine::Monorepo(id) => Some(id.clone()),
+        TrailerLine::Sync(_) => None,
+    });
+    Some(WriterClaim {
+        trailer: trailer.clone(),
+        monorepo,
+        forwarded,
+    })
 }
 
 /// The sync trailer the hop that created this commit wrote: the *last* `Monosplice-Source` or
@@ -400,6 +458,26 @@ mod tests {
         );
         // The same prose rule as get_trailer: not a trailer block, no claim.
         assert_eq!(writer_trailer("s\n\nMonosplice-Origin: u\nprose\n"), None);
+    }
+
+    #[test]
+    fn the_writer_claim_takes_the_id_after_it_and_never_one_before() {
+        let src = |v: &str| TrailerLine::Sync(SyncTrailer::Source(v.to_string()));
+        let id = |v: &str| TrailerLine::Monorepo(v.to_string());
+        let claim = writer_claim(&[src("outer"), id("outer-id"), src("middle"), id("middle-id")])
+            .expect("a claim");
+        assert_eq!(claim.trailer, SyncTrailer::Source("middle".to_string()));
+        assert_eq!(claim.monorepo.as_deref(), Some("middle-id"));
+        assert_eq!(claim.forwarded, 1);
+        // 1.0.0 forwarded an id-carrying claim and appended its own id-less one.
+        let claim = writer_claim(&[src("outer"), id("outer-id"), src("middle")]).expect("claim");
+        assert_eq!(claim.monorepo, None);
+        assert_eq!(writer_claim(&[id("lonely")]), None);
+        assert_eq!(
+            TrailerLine::parse("monosplice-monorepo:  abc "),
+            Some(id("abc"))
+        );
+        assert_eq!(TrailerLine::parse("Monosplice-Monorepo: "), None);
     }
 
     #[test]

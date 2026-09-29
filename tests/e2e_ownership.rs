@@ -505,7 +505,15 @@ fn s181_a_monorepo_with_an_id_from_the_start_imports_an_id_less_publishers_relea
 #[test]
 fn s181_without_an_id_an_unplaceable_claim_is_reported_not_skipped() {
     let p = publisher(None);
+    // Attaching is first contact whatever the claims say: its snapshot settles them.
     let k = p.consumer("kacho", None);
+    assert_eq!(k.read("vendor/lib/a.txt"), "v1\n");
+    assert_eq!(
+        k.tree_sha("HEAD", Some("vendor/lib")),
+        p.lib.tree_sha("main", None)
+    );
+    assert!(run_ok(&k.dir, &["status"]).stdout.contains("in sync"));
+    run_ok(&k.dir, &["doctor"]);
     p.mono.commit("lib v2", &[("lib/a.txt", Some("v2\n"))]);
     run_ok(&p.mono.dir, &["push"]);
     let claim = trailer(&p.lib, "main", SOURCE);

@@ -18,9 +18,11 @@ use crate::core::filter::filtered_subtree;
 use crate::core::git::{git, git_ok, rev_list};
 use crate::core::importer::{read_sequencer, sequencer_path};
 use crate::core::sync_view::{
-    is_triangular, load_sync_view, pull_source, try_load_fork_state, SyncView, SyncViewOptions,
+    is_triangular, load_sync_view, pull_source, try_load_fork_state, Foreign, SyncView,
+    SyncViewOptions, Unplaced,
 };
-use crate::core::trailers::{ORIGIN_TRAILER, SOURCE_TRAILER};
+use crate::core::trailers::{MONOREPO_TRAILER, ORIGIN_TRAILER, SOURCE_TRAILER};
+use crate::ops::unplaced_reason;
 use crate::report::{require_project, select_subrepos, Failure};
 
 #[derive(clap::Args, Debug)]
@@ -417,18 +419,27 @@ fn check_subrepo(
     report_counts(&mut section, root, subrepo, &view)?;
 
     for broken in &view.broken_source_refs {
+        let reason = unplaced_reason(broken);
+        let mut detail: Vec<&str> = vec![reason.as_str()];
+        detail.push(
+            "monosplice cannot tell what that claim published, so status, pull, push and tag all stop at it",
+        );
+        detail.push("rather than import past it or export over it.");
+        if broken.unplaced == Some(Unplaced::NoId) {
+            detail.push(
+                "If another monorepo publishes this repository, the monorepos that write to it need an `id`: a",
+            );
+            detail.push(
+                "monorepo whose config has had one from the start reads every id-less claim as somebody else's.",
+            );
+        }
         problem(
             &mut section,
             format!(
                 "standalone commit {} carries {SOURCE_TRAILER}: {}, but that monorepo commit does not exist in this clone.",
                 broken.pub_sha, broken.mono_sha
             ),
-            &[
-                "Usually the monorepo clone is missing history (a shallow or partial clone), or `remote` points",
-                "at a repository that was published from a different monorepo.",
-                "Run `git fetch --unshallow` (or fix `remote` in your config); monosplice refuses to export until",
-                "the mapping resolves, so nothing can be published on top of a history it cannot see.",
-            ],
+            &detail,
         );
     }
 
@@ -452,7 +463,6 @@ fn report_superseded_anchors(section: &mut Section, view: &SyncView) {
     if view.superseded_source_refs.is_empty() {
         return;
     }
-    let live = view.last_exported_mono.as_deref().unwrap_or("undefined");
     let oldest_first: Vec<String> = view
         .superseded_source_refs
         .iter()
@@ -465,21 +475,34 @@ fn report_superseded_anchors(section: &mut Section, view: &SyncView) {
         })
         .collect();
     let mut detail: Vec<&str> = oldest_first.iter().map(String::as_str).collect();
-    detail.push(
-        "Monorepo history was rewritten after that export, so the sha it recorded exists nowhere any",
-    );
-    detail.push(
-        "more. A newer standalone commit names a commit this clone has, and that anchor is what push",
-    );
-    detail.push("and pull are measured from; nothing below it can change the answer.");
-    note(
-        section,
-        format!(
-            "informational: {} historical anchor(s) unresolvable — superseded by live anchor at {live}.",
-            view.superseded_source_refs.len()
-        ),
-        &detail,
-    );
+    let headline = match view.last_exported_mono.as_deref() {
+        Some(live) => {
+            detail.push(
+                "Monorepo history was rewritten after that export, so the sha it recorded exists nowhere any",
+            );
+            detail.push(
+                "more. A newer standalone commit names a commit this clone has, and that anchor is what push",
+            );
+            detail.push("and pull are measured from; nothing below it can change the answer.");
+            format!(
+                "informational: {} historical anchor(s) unresolvable — superseded by live anchor at {live}.",
+                view.superseded_source_refs.len()
+            )
+        }
+        None => {
+            detail.push(
+                "They sit at or below a standalone commit this monorepo imported, so whoever wrote them, that",
+            );
+            detail.push(
+                "history is already in the monorepo and nothing below the import can change the answer.",
+            );
+            format!(
+                "informational: {} historical claim(s) unresolvable — settled by an import.",
+                view.superseded_source_refs.len()
+            )
+        }
+    };
+    note(section, headline, &detail);
 }
 
 /// `Monosplice-Source` trailers on the standalone branch that are not this monorepo's: claims
@@ -487,8 +510,9 @@ fn report_superseded_anchors(section: &mut Section, view: &SyncView) {
 /// earlier hop forwarded. Push and pull ignore them, so they are information, never a problem.
 fn report_foreign_claims(section: &mut Section, view: &SyncView) {
     let foreign = view.foreign_source_refs.len();
+    let copied = view.copied_source_refs.len();
     let forwarded = view.forwarded_source_trailers;
-    if foreign == 0 && forwarded == 0 {
+    if foreign == 0 && copied == 0 && forwarded == 0 {
         return;
     }
     let mut parts = Vec::new();
@@ -497,27 +521,51 @@ fn report_foreign_claims(section: &mut Section, view: &SyncView) {
             "{foreign} standalone commit(s) carry a {SOURCE_TRAILER} trailer written by another monorepo"
         ));
     }
+    if copied > 0 {
+        parts.push(format!(
+            "{copied} standalone commit(s) carry a copied {SOURCE_TRAILER} line naming a commit of this monorepo"
+        ));
+    }
     if forwarded > 0 {
         parts.push(format!(
             "{forwarded} {SOURCE_TRAILER} trailer(s) were forwarded from an earlier hop"
         ));
     }
-    let newest = view.foreign_source_refs.first().map(|r| {
-        format!(
-            "Newest: standalone commit {} names {}.",
+    let mut owned: Vec<String> = Vec::new();
+    if let Some(r) = view.foreign_source_refs.first() {
+        let how = match (r.foreign, r.monorepo.as_deref()) {
+            (Some(Foreign::Fetched), _) => {
+                "a commit of a standalone repository monosplice fetched, not a monorepo commit"
+                    .to_string()
+            }
+            (Some(Foreign::OtherId), Some(id)) => {
+                format!("{MONOREPO_TRAILER}: {id}, an id this monorepo has never had")
+            }
+            _ => format!(
+                "no {MONOREPO_TRAILER} id, and every claim this monorepo ever wrote carries one"
+            ),
+        };
+        owned.push(format!(
+            "Newest: standalone commit {} names {} — {how}.",
             r.pub_sha, r.mono_sha
-        )
-    });
-    let mut detail: Vec<&str> = Vec::new();
-    if let Some(newest) = &newest {
-        detail.push(newest.as_str());
-        detail.push(
-            "Another monorepo publishes this repository too, or it is a vendored copy of one that does; those",
+        ));
+        owned.push(
+            "Another monorepo publishes this repository too, or it is a vendored copy of one that does; pull"
+                .to_string(),
         );
-        detail.push(
-            "trailers name that monorepo's commits, and pull imports the commits carrying them like any other work.",
+        owned.push("imports the commits carrying those claims like any other work.".to_string());
+    }
+    if let Some(r) = view.copied_source_refs.first() {
+        owned.push(format!(
+            "Newest copied line: standalone commit {} names {}, but it neither reproduces that commit's tree",
+            r.pub_sha, r.mono_sha
+        ));
+        owned.push(
+            "nor sits on work both sides agree on (a cherry-pick or a pasted message): pull imports it."
+                .to_string(),
         );
     }
+    let mut detail: Vec<&str> = owned.iter().map(String::as_str).collect();
     if forwarded > 0 {
         detail.push(
             "A forwarded trailer was copied from an earlier hop by monosplice 1.0.0; only the last sync trailer",

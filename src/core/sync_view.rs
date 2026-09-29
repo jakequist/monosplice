@@ -7,13 +7,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::config::ResolvedSubrepo;
+use crate::config::{monorepo_id_of, ResolvedSubrepo, CONFIG_FILENAME, LEGACY_CONFIG_FILENAMES};
 use crate::core::filter::anchor_subtree;
 use crate::core::git::{
-    existing_commits, fetch_branch, git, git_with, is_shallow, ls_remote_branch, missing_objects,
-    rev_list, rev_parse, sync_trailers, GitError, GitOpts,
+    existing_commits, fetch_branch, file_versions, git, git_with, is_shallow, ls_remote_branch,
+    read_blobs, rev_list, rev_list_with_parents, rev_parse, split_lines, sync_trailers, GitError,
+    GitOpts,
 };
-use crate::core::trailers::SyncTrailer;
+use crate::core::trailers::{writer_claim, SyncTrailer, TrailerLine};
 
 /// Where a subrepo's public branch is mirrored inside the monorepo's object db.
 pub fn remote_tracking_ref(name: &str) -> String {
@@ -83,11 +84,43 @@ pub struct ForkState {
     pub head: Option<String>,
 }
 
-/// A public commit claiming to export a monorepo commit that this clone does not have.
+/// Why a `Monosplice-Source` claim this monorepo cannot place stops every command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unplaced {
+    /// This clone is shallow: the named commit may simply lie beyond its boundary.
+    Shallow,
+    /// The claim carries this monorepo's own id: an export of ours, of a commit this clone does
+    /// not have (made from a branch that was deleted or squash-merged, or from a commit that
+    /// was dropped or never pushed).
+    OwnId,
+    /// The claim carries no id, and this monorepo has not had one since its first config, so it
+    /// may have written that claim itself.
+    NoId,
+}
+
+/// How a claim was shown to be another monorepo's (or nobody's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Foreign {
+    /// It names a commit of a standalone repository monosplice fetched — no export of ours ever
+    /// names anything but a monorepo commit.
+    Fetched,
+    /// It carries a `Monosplice-Monorepo` id this monorepo has never had.
+    OtherId,
+    /// It carries no id, and every claim this monorepo ever wrote carries one.
+    NoIdEver,
+}
+
+/// A standalone commit's `Monosplice-Source` claim, as reported.
 #[derive(Debug, Clone)]
 pub struct BrokenSourceRef {
     pub pub_sha: String,
     pub mono_sha: String,
+    /// The `Monosplice-Monorepo` id written with the claim, if any.
+    pub monorepo: Option<String>,
+    /// For a claim that could not be placed: why.
+    pub unplaced: Option<Unplaced>,
+    /// For another monorepo's claim: how that was shown.
+    pub foreign: Option<Foreign>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,23 +149,24 @@ pub struct SyncView {
     pub last_exported_mono: Option<String>,
     /// Public commits that are neither our exports nor already reflected (oldest first).
     pub unreflected_pub: Vec<String>,
-    /// `Monosplice-Source` trailers naming monorepo commits this clone does not have, found on
-    /// or above the newest public commit whose trailer *does* resolve. Nothing above the
-    /// mapping's newest readable point can be checked, so export refuses while any exist.
+    /// `Monosplice-Source` claims this monorepo cannot place: they name commits this clone does
+    /// not have, sit above everything both sides agree on, and nothing shows whose they are
+    /// ([`Unplaced`] says why). They could be exports of ours, so no command acts past them.
     pub broken_source_refs: Vec<BrokenSourceRef>,
-    /// The same, but *behind* the newest resolvable anchor: history, not the mapping.
+    /// Claims naming commits this clone does not have, at or below something both sides agree
+    /// on (an import of ours, or a verified export of ours): history, not the mapping.
     ///
     /// A rebase on one machine rewrites the sha an earlier export recorded, and every clone made
-    /// afterwards is missing it forever. Once a newer public commit names a commit this clone
-    /// has, that anchor decides what is published and the dead trailers below it can no longer
-    /// change the answer — they are reported and never refused.
+    /// afterwards is missing it forever. Once the two sides agree on a newer point, the dead
+    /// trailers below it can no longer change the answer — they are reported and never refused.
     pub superseded_source_refs: Vec<BrokenSourceRef>,
-    /// `Monosplice-Source` claims on the standalone branch that name another monorepo's commits,
-    /// not this one's: the repository is also published from somewhere else, or it is a
-    /// vendored copy of a repository that is. They are never part of the mapping — neither
-    /// exports to skip nor anchors to validate — so the commits carrying them are ordinary
-    /// standalone work that `pull` imports. See [`classify_claims`] for how each is recognised.
+    /// Claims shown to be another monorepo's ([`Foreign`] says how). They are neither exports to
+    /// skip nor anchors to validate: the commits carrying them are standalone work to import.
     pub foreign_source_refs: Vec<BrokenSourceRef>,
+    /// Claims naming a commit of this monorepo on standalone commits that are not its exports:
+    /// a copied or cherry-picked line on work that neither reproduces that commit nor sits on
+    /// work both sides agree on. The commits carrying them are standalone work to import.
+    pub copied_source_refs: Vec<BrokenSourceRef>,
     /// `Monosplice-Source` trailers on the standalone branch that are not the last sync trailer
     /// of their commit: forwarded from an earlier hop (monosplice 1.0.0 copied them). Ignored.
     pub forwarded_source_trailers: usize,
@@ -142,6 +176,10 @@ pub struct SyncView {
     /// branch has history, but nothing on either side references the other, so the only safe
     /// move is `monosplice attach`.
     pub related: bool,
+    /// `related` only because of claims this monorepo cannot place ([`SyncView::broken_source_refs`]):
+    /// no import, no export of ours, nothing settled. Every command stops at those claims except
+    /// `attach`, whose snapshot of the standalone head is itself what settles them.
+    pub unplaced_only: bool,
 }
 
 /// The view of a subrepo whose public branch does not exist yet.
@@ -158,9 +196,11 @@ pub fn unpublished_view(name: &str) -> SyncView {
         broken_source_refs: Vec::new(),
         superseded_source_refs: Vec::new(),
         foreign_source_refs: Vec::new(),
+        copied_source_refs: Vec::new(),
         forwarded_source_trailers: 0,
         forwarded_origin_trailers: 0,
         related: false,
+        unplaced_only: false,
     }
 }
 
@@ -259,93 +299,105 @@ fn find_export_anchor(
     Ok((None, related))
 }
 
-/// Public commits the monorepo has not seen. Ancestry, not per-commit bookkeeping: a shallow
-/// snapshot `attach` records only the pub head as imported, and every ancestor of a reflected
-/// commit is reflected by construction. Our own exports drop out by trailer, and so does their
-/// ancestry: an export was only ever made on top of a standalone head the monorepo had already
-/// reflected, so whatever sits below a live export is settled.
-///
-/// Only this monorepo's claims drop out. A commit carrying another monorepo's
-/// `Monosplice-Source` is somebody else's published work, and is imported like any other.
-fn find_unreflected_pub(
-    root: &Path,
-    tracking_ref: &str,
-    imported_pub_shas: &HashSet<String>,
-    claims: &Claims,
-) -> Result<Vec<String>, GitError> {
-    // A forged or force-pushed-away Origin value would abort the whole rev-list, so only
-    // values that resolve to a commit here are allowed to negate anything.
-    let candidates: Vec<String> = imported_pub_shas.iter().cloned().collect();
-    let mut reflected = existing_commits(root, &candidates)?;
-    reflected.extend(claims.exported_pub.iter().cloned());
-    let out = if reflected.is_empty() {
-        git(root, &["rev-list", "--reverse", tracking_ref])?
-    } else {
-        // --stdin instead of argv: pub histories can carry thousands of reflected commits.
-        let input: String = reflected.iter().map(|sha| format!("^{sha}\n")).collect();
-        git_with(
-            root,
-            &["rev-list", "--reverse", tracking_ref, "--stdin"],
-            GitOpts {
-                input: Some(input.as_bytes()),
-                ..Default::default()
-            },
-        )?
-    };
-    if out.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(out
-        .split('\n')
-        .filter(|sha| !claims.ours_pub.contains(*sha))
-        .map(str::to_string)
-        .collect())
-}
-
-/// Split each commit's sync trailers into the claim of the hop that wrote it — the last one —
-/// and the forwarded rest. Returns commit -> claim value for claims of the wanted kind, plus
-/// how many trailers of that kind were forwarded.
+/// A commit's own claim of one kind, as written by the hop that made it: the last sync trailer on
+/// it, and the `Monosplice-Monorepo` id written after that trailer, if any. Returns commit ->
+/// claim, plus how many trailers of that kind were forwarded from an earlier hop (ignored).
 fn writer_claims(
-    trailers: &HashMap<String, Vec<SyncTrailer>>,
+    trailers: &HashMap<String, Vec<TrailerLine>>,
     want_source: bool,
-) -> (HashMap<String, String>, usize) {
+) -> (HashMap<String, SourceClaim>, usize) {
     let mut claims = HashMap::new();
     let mut forwarded = 0;
-    for (sha, list) in trailers {
-        let is_wanted = |t: &SyncTrailer| matches!(t, SyncTrailer::Source(_)) == want_source;
-        let Some((last, earlier)) = list.split_last() else {
+    for (sha, lines) in trailers {
+        let of_kind = lines
+            .iter()
+            .filter(|l| {
+                matches!(l, TrailerLine::Sync(t) if matches!(t, SyncTrailer::Source(_)) == want_source)
+            })
+            .count();
+        let Some(claim) = writer_claim(lines) else {
             continue;
         };
-        forwarded += earlier.iter().filter(|t| is_wanted(t)).count();
-        match last {
-            SyncTrailer::Source(v) if want_source => {
-                claims.insert(sha.clone(), v.clone());
+        let value = match (&claim.trailer, want_source) {
+            (SyncTrailer::Source(v), true) | (SyncTrailer::Origin(v), false) => v.clone(),
+            _ => {
+                forwarded += of_kind;
+                continue;
             }
-            SyncTrailer::Origin(v) if !want_source => {
-                claims.insert(sha.clone(), v.clone());
-            }
-            _ => {}
-        }
+        };
+        forwarded += of_kind - 1;
+        claims.insert(
+            sha.clone(),
+            SourceClaim {
+                mono: value,
+                monorepo: claim.monorepo,
+            },
+        );
     }
     (claims, forwarded)
 }
 
-/// What a standalone commit's `Monosplice-Source` claim names, as far as object lookups can say.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Resolved {
-    /// A commit on HEAD's history: this monorepo's export.
-    OnHead,
-    /// A commit this clone has but HEAD does not reach, found in a standalone repository
-    /// monosplice fetched (`refs/monosplice/*`): another repository's commit, never ours.
-    Fetched,
-    /// A commit this clone has, off HEAD and in no fetched repository: ours, rewritten away
-    /// (rebase, amend, force-push) — the case rewrite detection and anchor recovery handle.
-    OffHead,
-    /// Not a commit here at all.
-    Missing,
+/// One standalone commit's `Monosplice-Source` claim.
+#[derive(Debug, Clone)]
+struct SourceClaim {
+    mono: String,
+    monorepo: Option<String>,
 }
 
-/// The claims split by whose they are, plus the parts of the view derived from them.
+/// Which `Monosplice-Monorepo` ids this monorepo has ever had, and whether it has had one from
+/// its very first config. Read from every version `monosplice.toml` has had on HEAD's history,
+/// plus the config on disk: the file survives a rebase or a `filter-repo` of the code, so a
+/// rewrite cannot make one of our own ids look like a stranger's.
+struct Identity {
+    ever: HashSet<String>,
+    /// Every claim this monorepo ever wrote carries an id: it has an id now, every committed
+    /// version of its config had one, and it never used a JavaScript-era config (which predates
+    /// ids). A claim with no id is then provably not ours.
+    always: bool,
+}
+
+fn monorepo_identity(root: &Path, current: Option<&str>) -> Result<Identity, GitError> {
+    let mut ever: HashSet<String> = current.map(str::to_string).into_iter().collect();
+    let mut always = current.is_some();
+    if rev_parse(root, "HEAD").is_some() {
+        let mut legacy: Vec<&str> = vec!["-1", "HEAD", "--"];
+        legacy.extend(LEGACY_CONFIG_FILENAMES);
+        if !rev_list(root, &legacy)?.is_empty() {
+            always = false;
+        }
+        let versions = file_versions(root, "HEAD", CONFIG_FILENAME)?;
+        for blob in read_blobs(root, &versions)? {
+            match blob.and_then(|b| monorepo_id_of(&String::from_utf8_lossy(&b))) {
+                Some(id) => {
+                    ever.insert(id);
+                }
+                None => always = false,
+            }
+        }
+    }
+    Ok(Identity { ever, always })
+}
+
+/// What a claim turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// This monorepo's export: the standalone tree is exactly what the named commit publishes,
+    /// or the named commit is on HEAD's history and the claim sits directly on work both sides
+    /// already agree on (1.0.0's reading, which a changed `exclude` or `transform` still needs),
+    /// or it names a commit this clone has off HEAD's history that is nobody else's (a rewrite,
+    /// which rewrite detection then refuses or recovers).
+    Ours,
+    /// Names no commit here, but sits at or below something both sides agree on: history that
+    /// cannot change what is published or pulled.
+    Settled,
+    Foreign(Foreign),
+    /// Names a commit of this monorepo but is not its export: a copied or cherry-picked line on
+    /// standalone work that does not sit on agreed work and does not reproduce that commit.
+    Copied,
+    Unplaced(Unplaced),
+}
+
+/// The claims split by what could be shown about them, plus the view fields derived from them.
 #[derive(Debug, Default)]
 struct Claims {
     exported_mono_to_pub: HashMap<String, String>,
@@ -353,114 +405,75 @@ struct Claims {
     broken: Vec<BrokenSourceRef>,
     superseded: Vec<BrokenSourceRef>,
     foreign: Vec<BrokenSourceRef>,
-    /// Standalone commits carrying a claim of this monorepo's (resolvable or not).
-    ours_pub: HashSet<String>,
-    /// Standalone commits carrying a claim that resolves to one of our commits.
-    exported_pub: Vec<String>,
+    copied: Vec<BrokenSourceRef>,
+    unreflected_pub: Vec<String>,
 }
 
-/// Which of these standalone commits could be exports of commits on HEAD's history that a
-/// rewrite has since given new shas? An export copies author email, author time and — unless a
-/// `rewrite-message` hook rewrites it on the way out — the subject from the monorepo commit,
-/// and a rebase, amend or `filter-repo` keeps all three. Two git calls, however many commits.
-fn authored_like_ours<'a>(
-    root: &Path,
-    s: &ResolvedSubrepo,
-    pub_shas: &[&'a String],
-) -> Result<HashSet<&'a String>, GitError> {
-    let with_subject = s.rewrite_message.is_none();
-    let key = |ae: &str, at: &str, subject: &str| {
-        if with_subject {
-            format!("{ae}\0{at}\0{subject}")
-        } else {
-            format!("{ae}\0{at}")
-        }
-    };
-    let ours: HashSet<String> = git(
-        root,
-        &["log", "--format=%ae%x00%at%x00%s", "HEAD", "--", &s.path],
-    )?
-    .split('\n')
-    .filter_map(|line| {
-        let mut f = line.splitn(3, '\0');
-        Some(key(f.next()?, f.next()?, f.next().unwrap_or("")))
-    })
-    .collect();
-
-    let input: String = pub_shas.iter().map(|sha| format!("{sha}\n")).collect();
-    let theirs = git_with(
-        root,
-        &[
-            "log",
-            "--no-walk=unsorted",
-            "--stdin",
-            "--format=%H%x00%ae%x00%at%x00%s",
-        ],
-        GitOpts {
-            input: Some(input.as_bytes()),
-            ..Default::default()
-        },
-    )?;
-    let mut hits: HashSet<&'a String> = HashSet::new();
-    for line in theirs.split('\n') {
-        let mut f = line.splitn(4, '\0');
-        let (Some(sha), Some(ae), Some(at)) = (f.next(), f.next(), f.next()) else {
-            continue;
-        };
-        if ours.contains(&key(ae, at, f.next().unwrap_or(""))) {
-            if let Some(pub_sha) = pub_shas.iter().find(|p| p.as_str() == sha) {
-                hits.insert(pub_sha);
-            }
-        }
-    }
-    Ok(hits)
-}
-
-/// Decide, for every `Monosplice-Source` claim on the standalone branch, whether it is this
-/// monorepo's — and so part of the mapping — or another monorepo's, which is ignored.
+/// Sort every `Monosplice-Source` claim on the standalone branch by evidence, never by looks.
 ///
-/// A claim is ours when it names a commit on HEAD's history, or a commit this clone has that
-/// HEAD no longer reaches and that did not arrive from a standalone repository (a rewrite,
-/// which rewrite detection still refuses or recovers). It is foreign when it names a commit
-/// monosplice fetched from some *other* standalone repository, or when it sits on a standalone
-/// commit this monorepo imported: an import is by construction something we did not write.
+/// **Settled** first: every standalone commit at or below one this monorepo imported
+/// (`Monosplice-Origin`), or below a claim *verified* as ours — the standalone tree equals what
+/// the named commit on HEAD's history publishes today, so whatever happened below it is in that
+/// commit already. Ancestry, walked through the real parents, never commit-date order.
 ///
-/// A claim naming no commit here is where "foreign" and "cannot tell" part, and monosplice never
-/// guesses:
+/// Then each claim, oldest first (see [`Verdict`] for what each outcome means):
 ///
-/// - Below the newest claim that resolves as ours, nothing can change what is published: it is
-///   history, reported as superseded (or as foreign, once the branch is known to have another
-///   publisher).
-/// - Above it, a claim could be ours in a shallow clone (every such claim is), or when one of
-///   our commits carries the same authorship — an export copies it and a rebase, amend or
-///   `filter-repo` keeps it. Those stop, as they always did.
-/// - The rest are foreign when this monorepo has never exported to the branch (nothing of ours
-///   can be missing from it: a vendored copy of somebody else's publication), or when the
-///   branch has already shown another publisher by one of the certain rules above. On a branch
-///   this monorepo publishes and nobody else visibly does, a claim nobody can place is still a
-///   broken mapping.
+/// - names a commit on HEAD's history → ours when verified, settled, or when every parent of the
+///   claiming commit is settled or ours; otherwise it is a copied line, and the commit is
+///   standalone work to import like any other;
+/// - names a commit of a standalone repository monosplice fetched (reachable only from
+///   `refs/monosplice/*`) → another monorepo's (or nobody's): no export of ours ever names one;
+/// - names another commit this clone has → ours when verified or settled; another monorepo's
+///   when its id says so; otherwise ours, and rewrite detection decides, as in 1.0.0;
+/// - names nothing here → settled history when settled; unplaced in a shallow clone; unplaced
+///   when it carries our own id; another monorepo's when it carries an id we never had, or no id
+///   while we have always had one; unplaced otherwise.
+///
+/// Unplaced claims stop every command that could act on them. Nothing here reads authorship,
+/// dates or subjects, and no claim changes how any other claim is read.
+#[allow(clippy::too_many_arguments)]
 fn classify_claims(
     root: &Path,
     s: &ResolvedSubrepo,
-    pub_walk: &[String],
+    tracking_ref: &str,
+    graph: &[(String, Vec<String>)],
     head_walk: &[String],
-    source_by_pub: &HashMap<String, String>,
+    source_by_pub: &HashMap<String, SourceClaim>,
     imported_pub_shas: &HashSet<String>,
 ) -> Result<Claims, GitError> {
-    let mut claimed: Vec<String> = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
-    for pub_sha in pub_walk {
-        if let Some(mono_sha) = source_by_pub.get(pub_sha) {
-            if seen.insert(mono_sha.as_str()) {
-                claimed.push(mono_sha.clone());
-            }
-        }
-    }
-    let missing = missing_objects(root, &claimed)?;
+    // Settled by our imports: a forged or force-pushed-away Origin value would abort the whole
+    // rev-list, so only values that resolve to a commit here negate anything.
+    let candidates: Vec<String> = imported_pub_shas.iter().cloned().collect();
+    let imports = existing_commits(root, &candidates)?;
+    let mut settled: HashSet<String> = if imports.is_empty() {
+        HashSet::new()
+    } else {
+        // --stdin instead of argv: pub histories can carry thousands of reflected commits.
+        let input: String = imports.iter().map(|sha| format!("^{sha}\n")).collect();
+        let unsettled: HashSet<String> = split_lines(&git_with(
+            root,
+            &["rev-list", tracking_ref, "--stdin"],
+            GitOpts {
+                input: Some(input.as_bytes()),
+                ..Default::default()
+            },
+        )?)
+        .into_iter()
+        .collect();
+        graph
+            .iter()
+            .map(|(sha, _)| sha)
+            .filter(|sha| !unsettled.contains(*sha))
+            .cloned()
+            .collect()
+    };
+
+    let mut claimed: Vec<String> = source_by_pub.values().map(|c| c.mono.clone()).collect();
+    claimed.sort();
+    claimed.dedup();
+    let present: HashSet<String> = existing_commits(root, &claimed)?.into_iter().collect();
     let on_head: HashSet<&str> = head_walk.iter().map(String::as_str).collect();
-    let off_head = claimed
-        .iter()
-        .any(|sha| !missing.contains(sha) && !on_head.contains(sha.as_str()));
+    let off_head = present.iter().any(|sha| !on_head.contains(sha.as_str()));
     let fetched: HashSet<String> = if !off_head {
         HashSet::new()
     } else if head_walk.is_empty() {
@@ -472,98 +485,146 @@ fn classify_claims(
             .into_iter()
             .collect()
     };
-    let resolve = |mono_sha: &String| {
-        if missing.contains(mono_sha) {
-            Resolved::Missing
-        } else if on_head.contains(mono_sha.as_str()) {
-            Resolved::OnHead
-        } else if fetched.contains(mono_sha) {
-            Resolved::Fetched
-        } else {
-            Resolved::OffHead
+
+    // Verified exports, newest first. One on HEAD's history settles everything below it, so the
+    // claims under it need no tree of their own.
+    let mut verified: HashSet<&str> = HashSet::new();
+    for (pub_sha, _) in graph {
+        let Some(claim) = source_by_pub.get(pub_sha) else {
+            continue;
+        };
+        if !present.contains(&claim.mono)
+            || fetched.contains(&claim.mono)
+            || settled.contains(pub_sha)
+        {
+            continue;
         }
+        if !reflects_exactly(root, s, &claim.mono, pub_sha) {
+            continue;
+        }
+        verified.insert(pub_sha);
+        if on_head.contains(claim.mono.as_str()) {
+            settled.extend(rev_list(root, &[pub_sha])?);
+        }
+    }
+
+    let shallow = is_shallow(root);
+    let mut identity: Option<Identity> = None;
+    let mut foreign_by_id = |claim: &SourceClaim| -> Result<Option<Foreign>, GitError> {
+        if shallow {
+            return Ok(None);
+        }
+        if identity.is_none() {
+            identity = Some(monorepo_identity(root, s.monorepo_id.as_deref())?);
+        }
+        let Some(identity) = &identity else {
+            return Ok(None);
+        };
+        Ok(match &claim.monorepo {
+            Some(id) if identity.ever.contains(id) => None,
+            Some(_) => Some(Foreign::OtherId),
+            None if identity.always => Some(Foreign::NoIdEver),
+            None => None,
+        })
     };
 
-    let mut any_ours = false;
-    let mut other_publisher = false;
-    for (pub_sha, mono_sha) in source_by_pub {
-        match resolve(mono_sha) {
-            Resolved::OnHead | Resolved::OffHead => any_ours = true,
-            Resolved::Fetched => other_publisher = true,
-            Resolved::Missing => other_publisher |= imported_pub_shas.contains(pub_sha),
-        }
-    }
-
-    // Unplaceable claims above the newest claim that resolves as ours: the only ones whose
-    // owner matters, because nothing below a readable anchor can change what is published.
-    let newest_ours = pub_walk.iter().position(|pub_sha| {
-        source_by_pub
-            .get(pub_sha)
-            .is_some_and(|m| matches!(resolve(m), Resolved::OnHead | Resolved::OffHead))
-    });
-    let unplaceable: Vec<&String> = pub_walk[..newest_ours.unwrap_or(pub_walk.len())]
-        .iter()
-        .filter(|pub_sha| {
-            !imported_pub_shas.contains(*pub_sha)
-                && source_by_pub
-                    .get(*pub_sha)
-                    .is_some_and(|m| resolve(m) == Resolved::Missing)
-        })
-        .collect();
-    let mut looks_ours: HashSet<&String> = HashSet::new();
-    let mut all_could_be_ours = false;
-    if !unplaceable.is_empty() {
-        if is_shallow(root) || head_walk.is_empty() {
-            all_could_be_ours = true;
+    // Oldest first: a claim that rests on its parents needs their verdicts.
+    let mut verdicts: HashMap<&str, Verdict> = HashMap::new();
+    let mut ours_pub: HashSet<&str> = HashSet::new();
+    for (pub_sha, parents) in graph.iter().rev() {
+        let Some(claim) = source_by_pub.get(pub_sha) else {
+            continue;
+        };
+        let is_settled = settled.contains(pub_sha);
+        let verdict = if !present.contains(&claim.mono) {
+            if is_settled {
+                match foreign_by_id(claim)? {
+                    Some(why) => Verdict::Foreign(why),
+                    None => Verdict::Settled,
+                }
+            } else if shallow {
+                Verdict::Unplaced(Unplaced::Shallow)
+            } else {
+                match foreign_by_id(claim)? {
+                    Some(why) => Verdict::Foreign(why),
+                    None if claim.monorepo.is_some() => Verdict::Unplaced(Unplaced::OwnId),
+                    None => Verdict::Unplaced(Unplaced::NoId),
+                }
+            }
+        } else if on_head.contains(claim.mono.as_str()) {
+            let on_agreed_work = parents
+                .iter()
+                .all(|p| settled.contains(p) || ours_pub.contains(p.as_str()));
+            if verified.contains(pub_sha.as_str()) || is_settled || on_agreed_work {
+                Verdict::Ours
+            } else {
+                Verdict::Copied
+            }
+        } else if fetched.contains(&claim.mono) {
+            Verdict::Foreign(Foreign::Fetched)
+        } else if verified.contains(pub_sha.as_str()) || is_settled {
+            Verdict::Ours
         } else {
-            looks_ours = authored_like_ours(root, s, &unplaceable)?;
+            match foreign_by_id(claim)? {
+                Some(why) => Verdict::Foreign(why),
+                None => Verdict::Ours,
+            }
+        };
+        if verdict == Verdict::Ours {
+            ours_pub.insert(pub_sha);
         }
+        verdicts.insert(pub_sha, verdict);
     }
-    // One of our exports we cannot see means this branch has others we cannot see either.
-    let publishes_here = any_ours || !looks_ours.is_empty();
 
     let mut out = Claims::default();
-    for pub_sha in pub_walk {
-        let Some(mono_sha) = source_by_pub.get(pub_sha) else {
+    for (pub_sha, _) in graph {
+        let (Some(claim), Some(verdict)) =
+            (source_by_pub.get(pub_sha), verdicts.get(pub_sha.as_str()))
+        else {
             continue;
         };
-        let claim = BrokenSourceRef {
+        let reference = |unplaced, foreign| BrokenSourceRef {
             pub_sha: pub_sha.clone(),
-            mono_sha: mono_sha.clone(),
+            mono_sha: claim.mono.clone(),
+            monorepo: claim.monorepo.clone(),
+            unplaced,
+            foreign,
         };
-        let ours = match resolve(mono_sha) {
-            Resolved::OnHead | Resolved::OffHead => {
-                if out.last_exported_mono.is_none() {
-                    out.last_exported_mono = Some(mono_sha.clone());
-                }
-                out.exported_pub.push(pub_sha.clone());
-                true
+        match *verdict {
+            Verdict::Ours | Verdict::Settled | Verdict::Unplaced(_) => {
+                out.exported_mono_to_pub
+                    .entry(claim.mono.clone())
+                    .or_insert_with(|| pub_sha.clone());
             }
-            Resolved::Fetched => false,
-            Resolved::Missing if imported_pub_shas.contains(pub_sha) => false,
-            Resolved::Missing if out.last_exported_mono.is_some() => !other_publisher,
-            Resolved::Missing => {
-                all_could_be_ours
-                    || looks_ours.contains(pub_sha)
-                    || (publishes_here && !other_publisher)
-            }
-        };
-        if !ours {
-            out.foreign.push(claim);
-            continue;
+            Verdict::Foreign(_) | Verdict::Copied => {}
         }
-        out.ours_pub.insert(pub_sha.clone());
-        out.exported_mono_to_pub
-            .entry(mono_sha.clone())
-            .or_insert_with(|| pub_sha.clone());
-        if resolve(mono_sha) == Resolved::Missing {
-            if out.last_exported_mono.is_some() {
-                out.superseded.push(claim);
-            } else {
-                out.broken.push(claim);
+        match *verdict {
+            Verdict::Ours => {
+                if out.last_exported_mono.is_none() {
+                    out.last_exported_mono = Some(claim.mono.clone());
+                }
             }
+            Verdict::Settled => out.superseded.push(reference(None, None)),
+            Verdict::Unplaced(why) => out.broken.push(reference(Some(why), None)),
+            Verdict::Foreign(why) => out.foreign.push(reference(None, Some(why))),
+            Verdict::Copied => out.copied.push(reference(None, None)),
         }
     }
+
+    // Standalone commits this monorepo has not seen: not settled, and not carrying a claim that
+    // is ours or might be. Another monorepo's commits and copied lines are ordinary work.
+    out.unreflected_pub = graph
+        .iter()
+        .rev()
+        .filter(|(sha, _)| !settled.contains(sha))
+        .filter(|(sha, _)| {
+            !matches!(
+                verdicts.get(sha.as_str()),
+                Some(Verdict::Ours | Verdict::Settled | Verdict::Unplaced(_))
+            )
+        })
+        .map(|(sha, _)| sha.clone())
+        .collect();
     Ok(out)
 }
 
@@ -593,7 +654,7 @@ pub fn load_sync_view(
     let (writer_origins, forwarded_origin_trailers) = writer_claims(&mono_trailers, false);
     let origin_by_mono: HashMap<String, Vec<String>> = writer_origins
         .into_iter()
-        .map(|(mono_sha, pub_sha)| (mono_sha, vec![pub_sha]))
+        .map(|(mono_sha, claim)| (mono_sha, vec![claim.mono]))
         .collect();
     let imported_pub_shas: HashSet<String> = origin_by_mono.values().flatten().cloned().collect();
 
@@ -618,12 +679,8 @@ pub fn load_sync_view(
     let (source_by_pub, forwarded_source_trailers) =
         writer_claims(&sync_trailers(root, &[&tracking_ref])?, true);
 
-    // Newest first, so the newest public commit claiming a monorepo commit is the one the
-    // mapping records, and validation stops at the newest claim that resolves as ours: that
-    // commit is where the mapping is still readable, and everything below it is already
-    // published by construction.
-    let pub_walk = rev_list(root, &[&tracking_ref])?;
-    let pub_ancestors: HashSet<String> = pub_walk.iter().cloned().collect();
+    let graph = rev_list_with_parents(root, &tracking_ref)?;
+    let pub_ancestors: HashSet<String> = graph.iter().map(|(sha, _)| sha.clone()).collect();
     let head_walk = if head_exists && !(source_by_pub.is_empty() && origin_by_mono.is_empty()) {
         rev_list(root, &["HEAD"])?
     } else {
@@ -633,7 +690,8 @@ pub fn load_sync_view(
     let claims = classify_claims(
         root,
         s,
-        &pub_walk,
+        &tracking_ref,
+        &graph,
         &head_walk,
         &source_by_pub,
         &imported_pub_shas,
@@ -647,8 +705,17 @@ pub fn load_sync_view(
         &origin_by_mono,
         &pub_ancestors,
     )?;
-
-    let unreflected_pub = find_unreflected_pub(root, &tracking_ref, &imported_pub_shas, &claims)?;
+    // Related through nothing but claims nobody can place: whether this is first contact is
+    // exactly what cannot be told, so `attach` may make it (its snapshot settles them all).
+    let unplaced_only = related
+        && export_base.is_none()
+        && claims.last_exported_mono.is_none()
+        && claims.superseded.is_empty()
+        && !claims.broken.is_empty()
+        && !origin_by_mono
+            .values()
+            .flatten()
+            .any(|pub_sha| pub_ancestors.contains(pub_sha));
 
     Ok(SyncView {
         tracking_ref,
@@ -658,13 +725,15 @@ pub fn load_sync_view(
         origin_by_mono,
         export_base,
         last_exported_mono: claims.last_exported_mono,
-        unreflected_pub,
+        unreflected_pub: claims.unreflected_pub,
         broken_source_refs: claims.broken,
         superseded_source_refs: claims.superseded,
         foreign_source_refs: claims.foreign,
+        copied_source_refs: claims.copied,
         forwarded_source_trailers,
         forwarded_origin_trailers,
         related,
+        unplaced_only,
     })
 }
 
@@ -1034,51 +1103,109 @@ mod tests {
         assert!(view.unreflected_pub.is_empty());
     }
 
-    /// A rewrite (rebase, amend, `filter-repo`) gives our exported commit a new sha but keeps its
-    /// authorship, which the export copied. A clone made afterwards cannot resolve the claim,
-    /// yet a commit on its history is recognisably the one exported: the claim could be ours.
-    #[test]
-    fn an_unplaceable_claim_authored_like_one_of_our_commits_is_a_broken_source_ref() {
-        let f = Fixture::new("authored-like-ours");
-        f.sh("printf 'two\n' > core/two.txt");
-        let ours = f.commit("feat: two");
-        let tree = f.sh("git rev-parse HEAD:core");
-        let (ae, ad) = (
-            f.sh(&format!("git log -1 --format=%ae {ours}")),
-            f.sh(&format!("git log -1 --format=%ad --date=raw {ours}")),
-        );
-        let bogus = "0".repeat(40);
-        let pub_sha = f.sh(&format!(
-            "printf 'feat: two\n\nMonosplice-Source: {bogus}\n' | GIT_AUTHOR_EMAIL={ae} GIT_AUTHOR_DATE={} git commit-tree {tree}",
-            shq(&ad)
-        ));
-        f.sh(&format!(
-            "git push -q --force {} {pub_sha}:refs/heads/main",
-            f.remote_url()
-        ));
-
-        let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
-        assert_eq!(view.broken_source_refs.len(), 1, "{view:?}");
-        assert!(view.foreign_source_refs.is_empty());
-        assert!(view.related);
+    fn with_id(mut s: ResolvedSubrepo, id: &str) -> ResolvedSubrepo {
+        s.monorepo_id = Some(id.to_string());
+        s
     }
 
-    /// Standalone commits this monorepo imported are by construction not its exports, and a
-    /// claim naming a commit monosplice fetched from another standalone repository names that
-    /// repository's commit. Both are foreign whatever else the branch holds, and they show the
-    /// branch has another publisher — which is what lets a later unplaceable claim above our
-    /// own live export be read as that publisher's rather than as a broken mapping.
+    /// An id this monorepo has never had makes a claim another monorepo's; its own id makes an
+    /// unresolvable claim an export of its own that this clone cannot see. Each claim is read on
+    /// its own: the foreign one does not change how ours is read, nor the other way round.
     #[test]
-    fn imported_and_fetched_claims_are_foreign_and_reveal_another_publisher() {
-        let f = Fixture::new("other-publisher");
+    fn a_claims_id_says_whose_it_is_and_no_claim_changes_how_another_is_read() {
+        let f = Fixture::new("claim-ids");
+        f.sh("printf 'id = \"ours\"\n' > monosplice.toml");
+        let head = f.commit("config");
+        let s = with_id(f.subrepo(), "ours");
         let tree = f.sh("git rev-parse HEAD:core");
-        let theirs = "1".repeat(40);
+        let e0 = f.push_pub(
+            &tree,
+            None,
+            &format!("config\n\nMonosplice-Source: {head}\nMonosplice-Monorepo: ours\n"),
+        );
+        let theirs = f.push_pub(
+            &tree,
+            Some(&e0),
+            &format!(
+                "their release\n\nMonosplice-Source: {}\nMonosplice-Monorepo: theirs\n",
+                "1".repeat(40)
+            ),
+        );
+        let view = load_sync_view(f.root(), &s, &online()).expect("view");
+        assert!(view.broken_source_refs.is_empty(), "{view:?}");
+        assert_eq!(view.foreign_source_refs.len(), 1);
+        assert_eq!(view.foreign_source_refs[0].pub_sha, theirs);
+        assert_eq!(view.foreign_source_refs[0].foreign, Some(Foreign::OtherId));
+        assert_eq!(view.unreflected_pub, vec![theirs.clone()]);
+        assert_eq!(view.last_exported_mono.as_deref(), Some(head.as_str()));
+
+        let lost = f.push_pub(
+            &tree,
+            Some(&theirs),
+            &format!(
+                "ours, lost\n\nMonosplice-Source: {}\nMonosplice-Monorepo: ours\n",
+                "2".repeat(40)
+            ),
+        );
+        let view = load_sync_view(f.root(), &s, &online()).expect("view");
+        assert_eq!(view.broken_source_refs.len(), 1, "{view:?}");
+        assert_eq!(view.broken_source_refs[0].pub_sha, lost);
+        assert_eq!(view.broken_source_refs[0].unplaced, Some(Unplaced::OwnId));
+        assert_eq!(view.foreign_source_refs.len(), 1, "still theirs");
+        assert_eq!(view.unreflected_pub, vec![theirs]);
+    }
+
+    /// A claim with no id is provably not ours only when every claim we ever wrote carries one:
+    /// an id in every version of our config. A monorepo that added its id later may have written
+    /// the id-less claim itself.
+    #[test]
+    fn an_id_less_claim_is_foreign_only_if_we_have_always_had_an_id() {
+        for (history, expect_foreign) in [(&["ours"][..], true), (&["", "ours"][..], false)] {
+            let f = Fixture::new("id-less");
+            for id in history {
+                let line = if id.is_empty() {
+                    "# no id yet".to_string()
+                } else {
+                    format!("id = \"{id}\"")
+                };
+                f.sh(&format!("printf '%s\\n' {} > monosplice.toml", shq(&line)));
+                f.commit("config");
+            }
+            let s = with_id(f.subrepo(), "ours");
+            let tree = f.sh("git rev-parse HEAD:core");
+            let pub_sha = f.push_pub(
+                &tree,
+                None,
+                &format!("a 1.0.0 export\n\nMonosplice-Source: {}\n", "3".repeat(40)),
+            );
+            let view = load_sync_view(f.root(), &s, &online()).expect("view");
+            if expect_foreign {
+                assert_eq!(view.foreign_source_refs.len(), 1, "{view:?}");
+                assert_eq!(view.foreign_source_refs[0].foreign, Some(Foreign::NoIdEver));
+                assert_eq!(view.unreflected_pub, vec![pub_sha]);
+                assert!(!view.related, "nothing of ours: first contact");
+            } else {
+                assert_eq!(view.broken_source_refs.len(), 1, "{view:?}");
+                assert_eq!(view.broken_source_refs[0].unplaced, Some(Unplaced::NoId));
+                assert!(view.unreflected_pub.is_empty());
+                assert!(view.unplaced_only);
+            }
+        }
+    }
+
+    /// Everything at or below a standalone commit this monorepo imported is settled, whoever
+    /// wrote it. Above our own verified export, an id-less claim naming nothing here stays
+    /// unplaced for a monorepo without an id — no earlier claim, imported or fetched, turns it
+    /// into "another publisher's".
+    #[test]
+    fn below_an_import_claims_are_settled_and_nothing_latches() {
+        let f = Fixture::new("settled-no-latch");
+        let tree = f.sh("git rev-parse HEAD:core");
         let published = f.push_pub(
             &tree,
             None,
-            &format!("their release\n\nMonosplice-Source: {theirs}\n"),
+            &format!("their release\n\nMonosplice-Source: {}\n", "1".repeat(40)),
         );
-        // A snapshot attach imports it: core/ already equals its tree.
         let attach = f.commit(&format!("Adopt core\n\nMonosplice-Origin: {published}\n"));
         f.sh("printf 'patch\n' > core/patch.txt");
         let patch = f.commit("fix: our patch");
@@ -1088,25 +1215,58 @@ mod tests {
             Some(&published),
             &format!("fix: our patch\n\nMonosplice-Source: {patch}\n"),
         );
-        let later = "2".repeat(40);
-        let upstream = f.push_pub(
+        let later = f.push_pub(
             &patch_tree,
             Some(&exported),
-            &format!("their next release\n\nMonosplice-Source: {later}\n"),
+            &format!(
+                "their next release\n\nMonosplice-Source: {}\n",
+                "2".repeat(40)
+            ),
         );
 
         let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
-        assert!(view.broken_source_refs.is_empty(), "{view:?}");
-        let foreign: Vec<&str> = view
-            .foreign_source_refs
-            .iter()
-            .map(|r| r.pub_sha.as_str())
-            .collect();
-        assert_eq!(foreign, vec![upstream.as_str(), published.as_str()]);
+        assert_eq!(view.superseded_source_refs.len(), 1, "{view:?}");
+        assert_eq!(view.superseded_source_refs[0].pub_sha, published);
+        assert_eq!(view.broken_source_refs.len(), 1);
+        assert_eq!(view.broken_source_refs[0].pub_sha, later);
+        assert_eq!(view.broken_source_refs[0].unplaced, Some(Unplaced::NoId));
+        assert!(view.foreign_source_refs.is_empty());
         assert_eq!(view.last_exported_mono.as_deref(), Some(patch.as_str()));
         assert_eq!(view.export_base.as_deref(), Some(patch.as_str()));
         assert_ne!(view.export_base.as_deref(), Some(attach.as_str()));
-        assert_eq!(view.unreflected_pub, vec![upstream]);
+        assert!(view.unreflected_pub.is_empty());
+        assert!(!view.unplaced_only);
+    }
+
+    /// A Source line copied onto standalone work that sits on unimported work and does not
+    /// reproduce the commit it names is not our export: it and everything below it are to pull.
+    /// Only a *verified* export settles what is below it.
+    #[test]
+    fn a_copied_line_is_not_ours_and_settles_nothing() {
+        let f = Fixture::new("copied-line");
+        let head = f.sh("git rev-parse HEAD");
+        let tree = f.sh("git rev-parse HEAD:core");
+        let e0 = f.push_pub(
+            &tree,
+            None,
+            &format!("first commit\n\nMonosplice-Source: {head}\n"),
+        );
+        let blob = f.sh("printf 'contrib\n' | git hash-object -w --stdin");
+        let t1 = f.sh(&format!(
+            "(git ls-tree {tree}; printf '100644 blob {blob}\\tc1.txt\\n') | git mktree"
+        ));
+        let c1 = f.push_pub(&t1, Some(&e0), "contrib 1\n");
+        let c2 = f.push_pub(
+            &t1,
+            Some(&c1),
+            &format!("contrib 2\n\nMonosplice-Source: {head}\n"),
+        );
+        let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
+        assert!(view.broken_source_refs.is_empty(), "{view:?}");
+        assert_eq!(view.copied_source_refs.len(), 1);
+        assert_eq!(view.copied_source_refs[0].pub_sha, c2);
+        assert_eq!(view.unreflected_pub, vec![c1, c2]);
+        assert_eq!(view.export_base.as_deref(), Some(head.as_str()));
     }
 
     /// A commit monosplice fetched from another standalone repository resolves here, but it is

@@ -20,8 +20,10 @@ use crate::core::filter::{has_committed_files, FilterError};
 use crate::core::git::{commit_subjects, rev_list, rev_parse, GitError};
 use crate::core::importer::{check_import_preconditions, run_import, ImportError, PullSequencer};
 use crate::core::sync_view::{
-    load_sync_view, pull_source, SyncView, SyncViewError, SyncViewOptions,
+    load_sync_view, pull_source, BrokenSourceRef, SyncView, SyncViewError, SyncViewOptions,
+    Unplaced,
 };
+use crate::core::trailers::{MONOREPO_TRAILER, SOURCE_TRAILER};
 use crate::report::{warn, SubrepoFailure};
 
 /// The first ten characters of a sha, the length every message abbreviates to.
@@ -101,6 +103,53 @@ pub fn unreachable_source(subrepo: &ResolvedSubrepo, err: &GitError) -> SubrepoF
         subrepo.name,
         pull_source(subrepo),
         git_stderr(err)
+    ))
+}
+
+/// Why a claim could not be placed, in one sentence the user can act on.
+pub fn unplaced_reason(broken: &BrokenSourceRef) -> String {
+    match (broken.unplaced, broken.monorepo.as_deref()) {
+        (Some(Unplaced::Shallow), _) => {
+            "This clone is shallow, so that commit may simply lie beyond its boundary; `git fetch --unshallow` fetches it if it exists.".to_string()
+        }
+        (Some(Unplaced::OwnId), Some(id)) => format!(
+            "The claim carries this monorepo's own id ({MONOREPO_TRAILER}: {id}): it is an export of this monorepo, made from a commit this clone does not have — a branch deleted or squash-merged after the push, or a commit dropped or never pushed. Fetch that commit into this clone (from the clone or branch that made it) to continue."
+        ),
+        _ => format!(
+            "The claim carries no {MONOREPO_TRAILER} id, and this monorepo has not had an `id` in its config since its first one, so monosplice cannot tell another monorepo's export (monosplice 1.0.0 wrote no id) from an export of this monorepo's own that this clone cannot see."
+        ),
+    }
+}
+
+/// The refusal every command but `push` gives for a claim it cannot place (`push` keeps 1.0.0's
+/// wording, which already refused). `consequence` says what was not done.
+pub fn unplaced_claim(
+    subrepo: &ResolvedSubrepo,
+    broken: &BrokenSourceRef,
+    consequence: &str,
+) -> String {
+    format!(
+        "{}: standalone commit {} carries {SOURCE_TRAILER}: {}, but that monorepo commit does not exist in this clone.
+{}
+monosplice cannot tell what is already published, so it will not import or export past that commit. {consequence}
+Run `monosplice doctor {}` to see the full picture.",
+        subrepo.name,
+        broken.pub_sha,
+        broken.mono_sha,
+        unplaced_reason(broken),
+        subrepo.name
+    )
+}
+
+/// The one-line form `status` prints in place of the counts.
+pub fn unplaced_status(subrepo: &ResolvedSubrepo, view: &SyncView) -> Option<String> {
+    let broken = view.broken_source_refs.first()?;
+    Some(format!(
+        "{}: stopped — standalone commit {} names {}, which this clone cannot place (run `monosplice doctor {}`)",
+        subrepo.name,
+        short(&broken.pub_sha),
+        short(&broken.mono_sha),
+        subrepo.name
     ))
 }
 
@@ -251,6 +300,16 @@ pub fn import_subrepo(
     if !view.related {
         return Err(SubrepoFailure::new(unrelated_remote(
             subrepo,
+            "Nothing was imported.",
+        )));
+    }
+
+    // A claim that could be ours sits above everything both sides agree on: importing around it
+    // would bring in work whose place in the mapping nobody can tell (1.0.0 skipped it silently).
+    if let Some(broken) = view.broken_source_refs.first() {
+        return Err(SubrepoFailure::new(unplaced_claim(
+            subrepo,
+            broken,
             "Nothing was imported.",
         )));
     }
@@ -505,6 +564,13 @@ pub fn plan_pull_dry_run(
     if !view.related {
         return Err(SubrepoFailure::new(unrelated_remote(
             subrepo,
+            "Nothing was imported.",
+        )));
+    }
+    if let Some(broken) = view.broken_source_refs.first() {
+        return Err(SubrepoFailure::new(unplaced_claim(
+            subrepo,
+            broken,
             "Nothing was imported.",
         )));
     }
