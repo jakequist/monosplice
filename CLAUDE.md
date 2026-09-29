@@ -10,10 +10,16 @@ brain and submodule-free ergonomics."
   histories. Monosplice replays commits across the boundary and records the correspondence.
   We never try to make the public repo a deterministic filter of monorepo history.
 - **Trailers are the source of truth for the commit mapping.**
-  - Exported public commits carry `Monosplice-Source: <monorepo-sha>`.
+  - Exported public commits carry `Monosplice-Source: <monorepo-sha>`, followed by
+    `Monosplice-Monorepo: <id>` when the config has a top-level `id` (`init` writes one).
   - Imported monorepo commits carry `Monosplice-Origin: <public-sha>` — the marker that a pub
     commit is reflected in mono (so `pull` skips it and `push` stops refusing).
-  - Import skips pub commits with `Monosplice-Source` (our own exports).
+  - A replay strips every earlier hop's sync line, wherever it sits in the message, and only
+    the last sync trailer on a commit is its claim.
+  - Import skips pub commits whose `Monosplice-Source` is *shown* to be ours (tree-verified, or
+    on agreed work — see `classify_claims`); another monorepo's claims are imported like any
+    work, and a claim that can be neither shown ours nor shown foreign stops every command.
+    Never decide ownership from authorship, dates or subjects.
   - Export does NOT skip by trailer: a pure import's tree already equals the pub tip, so the
     tree-equality no-op check drops it; a *conflicted* import (merge of mono + pub edits)
     differs from the pub tip and MUST export, or the resolution would be lost. This is what
