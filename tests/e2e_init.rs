@@ -198,3 +198,66 @@ fn harness_selftest() {
         push.stdout
     );
 }
+
+/// The `id = "…"` line of a config, if any.
+fn config_id(text: &str) -> Option<String> {
+    text.lines().find_map(|l| {
+        let rest = l.trim().strip_prefix("id")?.trim_start().strip_prefix('=')?;
+        Some(rest.trim().trim_matches('"').to_string())
+    })
+}
+
+/// S184: `init` gives every new monorepo its own `id`, and an export from it carries that id
+/// after its `Monosplice-Source` — the line another monorepo publishing the same standalone
+/// branch reads to tell the two apart.
+#[test]
+fn s184_init_writes_a_fresh_id_that_every_export_carries() {
+    let sb = sandbox();
+    let one = make_repo(sb.path(), "one");
+    let two = make_repo(sb.path(), "two");
+    assert_eq!(run_monosplice(&one.dir, &["init"]).exit_code, 0);
+    assert_eq!(run_monosplice(&two.dir, &["init"]).exit_code, 0);
+    let id_one = config_id(&one.read("monosplice.toml")).expect("init writes an id");
+    let id_two = config_id(&two.read("monosplice.toml")).expect("init writes an id");
+    assert_ne!(id_one, id_two, "every monorepo gets its own id");
+    assert!(id_one.len() >= 16, "{id_one}");
+    assert!(
+        id_one
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
+        "{id_one}"
+    );
+
+    let pub_dir = make_bare_remote(sb.path(), "lib");
+    one.commit("lib v1", &[("lib/a.txt", Some("v1\n"))]);
+    let attach = run_monosplice(&one.dir, &["attach", "lib", &pub_dir, "--yes"]);
+    assert_eq!(attach.exit_code, 0, "{}", attach.stderr);
+    one.commit("lib v2", &[("lib/a.txt", Some("v2\n"))]);
+    assert_eq!(run_monosplice(&one.dir, &["push"]).exit_code, 0);
+    let lib = TestRepo::new(&pub_dir);
+    for rev in ["main", "main~1"] {
+        let trailers = lib.git(&[
+            "log",
+            "-1",
+            "--format=%(trailers:key=Monosplice-Source,key=Monosplice-Monorepo)",
+            rev,
+        ]);
+        let lines: Vec<&str> = trailers.lines().collect();
+        assert_eq!(lines.len(), 2, "{rev}: {trailers}");
+        assert!(lines[0].starts_with("Monosplice-Source: "), "{trailers}");
+        assert_eq!(lines[1], format!("Monosplice-Monorepo: {id_one}"));
+    }
+}
+
+/// S184: an `id` is a single token; anything that could not sit on one trailer line is refused
+/// with the file and the field named.
+#[test]
+fn s184_an_id_that_cannot_be_a_trailer_value_is_refused() {
+    let sb = sandbox();
+    let mono = make_repo(sb.path(), "mono");
+    mono.write("monosplice.toml", "id = \"two words\"\n");
+    let res = run_monosplice(&mono.dir, &["status"]);
+    assert_ne!(res.exit_code, 0, "{}", res.stdout);
+    assert!(res.stderr.contains("monosplice.toml"), "{}", res.stderr);
+    assert!(res.stderr.contains("id"), "{}", res.stderr);
+}
