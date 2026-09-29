@@ -690,3 +690,139 @@ fn s175_doctor_reports_another_monorepos_trailers_as_information() {
         Some(1)
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// S183: no sync line from an earlier hop reaches the next repository, wherever it sits.
+// ---------------------------------------------------------------------------------------------
+
+/// A private sha from an earlier hop, standing in for an outer monorepo's commit.
+const PRIV: &str = "feedfacefeedfacefeedfacefeedfacefeedface";
+
+/// Message shapes that put an earlier hop's sync line outside the final trailer block (the
+/// reviewer's d5): git never parses these as trailers, but the text still carries the sha.
+const LEAK_SHAPES: &[(&str, &str)] = &[
+    ("final block", "subj\n\nMonosplice-Source: {P}\n"),
+    ("lower-case key", "subj\n\nmonosplice-source: {P}\n"),
+    ("space before colon", "subj\n\nMonosplice-Source : {P}\n"),
+    ("no space after colon", "subj\n\nMonosplice-Source:{P}\n"),
+    ("origin", "subj\n\nMonosplice-Origin: {P}\n"),
+    ("monorepo id", "subj\n\nMonosplice-Monorepo: {P}\n"),
+    (
+        "GitHub squash body",
+        "Title (#12)\n\n* outer: patch\n\nMonosplice-Source: {P}\n\n* other\n\nCo-authored-by: A <a@b.c>\n",
+    ),
+    ("block then # paragraph", "subj\n\nMonosplice-Source: {P}\n\n# a note\n"),
+    ("block then --- paragraph", "subj\n\nMonosplice-Source: {P}\n\n---\nnotes\n"),
+    (
+        "indented continuation",
+        "subj\n\nSigned-off-by: A <a@b.c>\n Monosplice-Source: {P}\n",
+    ),
+    ("CRLF", "subj\r\n\r\nMonosplice-Source: {P}\r\n"),
+    (
+        "whitespace-only separator",
+        "subj\n\nMonosplice-Source: {P}\n \nSigned-off-by: A <a@b.c>\n",
+    ),
+];
+
+fn commit_verbatim(repo: &TestRepo, message: &str, file: &str, content: &str) {
+    repo.write(file, content);
+    repo.git(&["add", "-A"]);
+    repo.git_with(
+        &["commit", "-q", "--cleanup=verbatim", "-F", "-"],
+        &[],
+        Some(message),
+    );
+}
+
+/// d5: on export, every shape loses the line; the rest of the message survives.
+#[test]
+fn s183_an_export_carries_no_earlier_hops_sync_line_in_any_shape() {
+    let p = published();
+    for (i, (name, shape)) in LEAK_SHAPES.iter().enumerate() {
+        let message = shape.replace("{P}", PRIV);
+        commit_verbatim(&p.publisher, &message, "lib/n.txt", &format!("{i}\n"));
+        run_ok(&p.publisher.dir, &["push"]);
+        let lib = TestRepo::new(&p.lib_dir);
+        let body = lib.git(&["log", "-1", "--format=%B", "main"]);
+        assert!(!body.contains(PRIV), "[{name}] leaked:\n{body}");
+        assert_eq!(
+            trailer(&lib, "main", SOURCE),
+            vec![p.publisher.head()],
+            "[{name}]:\n{body}"
+        );
+        let subject = message.lines().next().unwrap_or("").trim_end();
+        assert!(
+            body.starts_with(subject),
+            "[{name}] lost its subject:\n{body}"
+        );
+    }
+    let lib = TestRepo::new(&p.lib_dir);
+    let squash = lib.git(&["log", "--format=%B", "--grep=Title (#12)", "main"]);
+    assert!(squash.contains("* other"), "{squash}");
+    assert!(squash.contains("Co-authored-by: A <a@b.c>"), "{squash}");
+}
+
+/// d6: a `rewrite-message` hook that appends a footer paragraph pushes an earlier hop's
+/// trailer block into the body, where a final-paragraph strip no longer sees it. Stripping runs
+/// before the hook and again after it.
+#[test]
+fn s183_a_rewrite_message_footer_does_not_carry_an_earlier_hops_line_out() {
+    let sb = sandbox();
+    let root = sb.path();
+    let lib_dir = make_bare_remote(root, "lib");
+    let mono = make_repo(root, "mono");
+    write_config(
+        &mono,
+        &[&subrepo_block(&[
+            ("name", &toml_str("lib")),
+            ("path", &toml_str("lib")),
+            ("remote", &toml_str(&lib_dir)),
+            (
+                "rewrite-message",
+                &toml_str("cat; printf '\\nExported-by: monosplice\\n'"),
+            ),
+        ])],
+    );
+    mono.commit("lib v1", &[("lib/a.txt", Some("v1\n"))]);
+    run_ok(&mono.dir, &["attach", "lib", "--yes"]);
+    commit_verbatim(
+        &mono,
+        &format!("outer: patch\n\n{SOURCE}: {PRIV}\n"),
+        "lib/n.txt",
+        "x\n",
+    );
+    run_ok(&mono.dir, &["push"]);
+    let lib = TestRepo::new(&lib_dir);
+    let body = lib.git(&["log", "-1", "--format=%B", "main"]);
+    assert!(!body.contains(PRIV), "leaked:\n{body}");
+    assert!(body.contains("Exported-by: monosplice"), "{body}");
+    assert_eq!(trailer(&lib, "main", SOURCE), vec![mono.head()]);
+}
+
+/// The same on import: a standalone commit whose body carries an earlier hop's line anywhere
+/// lands in the monorepo with none of it, and with exactly one Origin.
+#[test]
+fn s183_an_import_carries_no_earlier_hops_sync_line_in_any_shape() {
+    let p = published();
+    run_ok(&p.consumer.dir, &["attach", "vendor/lib"]);
+    let lw = clone_remote(p.sb.path(), &p.lib_dir, "lw");
+    let shapes = [
+        "fix: y\n\n* a\n\nMonosplice-Source: {P}\n\n* b\n",
+        "fix: z\n\nSigned-off-by: A <a@b.c>\n Monosplice-Origin: {P}\n\n---\nnotes\n",
+    ];
+    for (i, shape) in shapes.iter().enumerate() {
+        commit_verbatim(
+            &lw,
+            &shape.replace("{P}", PRIV),
+            &format!("f{i}.txt"),
+            "x\n",
+        );
+    }
+    lw.git(&["push", "-q", "origin", "main"]);
+    run_ok(&p.consumer.dir, &["pull"]);
+    for rev in ["HEAD", "HEAD~1"] {
+        let body = p.consumer.git(&["log", "-1", "--format=%B", rev]);
+        assert!(!body.contains(PRIV), "{rev} leaked:\n{body}");
+        assert_eq!(trailer(&p.consumer, rev, ORIGIN).len(), 1, "{body}");
+    }
+}

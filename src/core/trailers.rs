@@ -426,9 +426,54 @@ mod tests {
             strip_sync_trailers("s\n\nSigned-off-by: A <a@b.c>\nMonosplice-Source: m\nprose\n"),
             "s\n\nSigned-off-by: A <a@b.c>\nprose\n"
         );
-        // Only the final paragraph holds trailers; an earlier one is body text.
-        let body_mention = "s\n\nMonosplice-Source: in the body\n\nTicket: 7\n";
-        assert_eq!(strip_sync_trailers(body_mention), body_mention);
+        // A sync line in an earlier paragraph is not a trailer to git, but it still carries the
+        // earlier hop's sha: it goes too, and so does the paragraph it leaves empty.
+        assert_eq!(
+            strip_sync_trailers("s\n\nMonosplice-Source: in the body\n\nTicket: 7\n"),
+            "s\n\nTicket: 7\n"
+        );
+    }
+
+    #[test]
+    fn strip_removes_sync_lines_wherever_they_sit() {
+        let p = "feedface";
+        for (shape, expected) in [
+            (
+                "Title (#12)\n\n* outer: patch\n\nMonosplice-Source: feedface\n\n* other\n\nCo-authored-by: A <a@b.c>\n",
+                "Title (#12)\n\n* outer: patch\n\n* other\n\nCo-authored-by: A <a@b.c>\n",
+            ),
+            (
+                "subj\n\nMonosplice-Source: feedface\n\n# a note\n",
+                "subj\n\n# a note\n",
+            ),
+            (
+                "subj\n\nMonosplice-Source: feedface\n\n---\nnotes\n",
+                "subj\n\n---\nnotes\n",
+            ),
+            (
+                "subj\n\nSigned-off-by: A <a@b.c>\n Monosplice-Source: feedface\n",
+                "subj\n\nSigned-off-by: A <a@b.c>\n",
+            ),
+            (
+                "subj\n\nMonosplice-Source : feedface\n\tmonosplice-origin:feedface\n",
+                "subj\n",
+            ),
+            (
+                "subj\n\nMonosplice-Source: x\nMonosplice-Monorepo: feedface\n",
+                "subj\n",
+            ),
+            (
+                "subj\r\n\r\nbody\r\n\r\nMonosplice-Source: feedface\r\n",
+                "subj\n\nbody\n",
+            ),
+        ] {
+            let out = strip_sync_trailers(shape);
+            assert!(!out.contains(p), "{shape:?} -> {out:?}");
+            assert_eq!(out, expected, "{shape:?}");
+        }
+        // Mentions that are not a sync line stay.
+        let prose = "s\n\nWe dropped the Monosplice-Source: trailer from the docs.\n";
+        assert_eq!(strip_sync_trailers(prose), prose);
     }
 
     #[test]
