@@ -179,13 +179,14 @@ pub fn compute_exports(
             }
         }
 
-        let mut message = meta.message.clone();
+        // Sync lines already in the message belong to the hop that wrote them; forwarded, they
+        // would read as claims about this standalone repo, or publish that hop's sha as text.
+        // Stripped before `rewrite-message` (so a hook that wraps the message cannot move them
+        // out of reach) and again after it (so a hook cannot put them back).
+        let mut message = strip_sync_trailers(&meta.message);
         if let Some(cmd) = &subrepo.rewrite_message {
-            message = run_rewrite_message(cmd, root, &subrepo.name, &meta.sha, &meta.message)?;
+            message = run_rewrite_message(cmd, root, &subrepo.name, &meta.sha, &message)?;
         }
-        // Sync trailers already in the message belong to the hop that wrote them; forwarded,
-        // they would read as claims about this standalone repo. `rewrite-message` runs first,
-        // so a hook cannot put them back either.
         message = append_source_claim(
             &strip_sync_trailers(&message),
             &meta.sha,

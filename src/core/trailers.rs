@@ -106,9 +106,12 @@ pub fn get_trailer(message: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Is this line one of monosplice's own sync trailers? Keys compare case-insensitively, the
-/// way git's trailer parsing (which the sync view reads through) compares them.
+/// Is this line one of monosplice's own sync lines, wherever it sits: optional leading
+/// whitespace (an indented continuation line), a sync key in any letter case, optional
+/// whitespace, then a colon. Keys compare case-insensitively, the way git's trailer parsing
+/// (which the sync view reads through) compares them.
 fn is_sync_trailer_line(line: &str) -> bool {
+    let line = line.trim_start_matches(is_space);
     let Some(idx) = line.find(':') else {
         return false;
     };
@@ -118,40 +121,44 @@ fn is_sync_trailer_line(line: &str) -> bool {
         || key.eq_ignore_ascii_case(MONOREPO_TRAILER)
 }
 
-/// Remove every `Monosplice-Source` / `Monosplice-Origin` line from the final paragraph of a
-/// message, dropping the paragraph if nothing else was in it.
+/// Remove every `Monosplice-Source` / `Monosplice-Origin` / `Monosplice-Monorepo` line from a
+/// message, wherever it sits, and any paragraph that leaves empty.
 ///
 /// A sync trailer states a fact about the one hop that wrote it: this commit reflects that
 /// commit, in the repository on the other side of *that* boundary. Carried into the next
-/// repository it reads as that repository's own claim, so every replay strips them before
-/// appending its own. The whole final paragraph is searched, not just a strict trailer block:
-/// git also reads trailers from a paragraph that mixes them with prose once a git-generated
-/// trailer such as `Signed-off-by` is present.
+/// repository it reads as that repository's own claim when it is a trailer, and it publishes the
+/// earlier hop's (possibly private) sha as text when it is not — a GitHub squash body, a block
+/// followed by another paragraph, an indented continuation line. So every replay removes them all
+/// before appending its own.
 ///
 /// A message with nothing to strip is returned byte-for-byte, so a single-hop replay produces
-/// exactly the message it always did.
+/// exactly the message it always did. One that held nothing else keeps a placeholder subject:
+/// a message made only of the trailer appended next would be read by git as a subject, not as a
+/// trailer, and the claim would be lost.
 pub fn strip_sync_trailers(message: &str) -> String {
     let normalized = message.replace("\r\n", "\n");
-    let body = trim_end_js(&normalized);
-    // The subject is never a trailer; a one-paragraph message has nothing to strip.
-    let Some(split) = body.rfind("\n\n") else {
-        return message.to_string();
-    };
-    let last = &body[split + 2..];
-    let lines: Vec<&str> = last.split('\n').collect();
-    let kept: Vec<&str> = lines
-        .iter()
-        .copied()
-        .filter(|line| !is_sync_trailer_line(line))
-        .collect();
-    if kept.len() == lines.len() {
+    if !normalized.split('\n').any(is_sync_trailer_line) {
         return message.to_string();
     }
-    let head = trim_end_js(&body[..split]);
-    if kept.iter().all(|line| trim_js(line).is_empty()) {
-        return format!("{head}\n");
+    let mut paragraphs: Vec<Vec<&str>> = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for line in normalized.split('\n') {
+        if trim_js(line).is_empty() {
+            if !current.is_empty() {
+                paragraphs.push(std::mem::take(&mut current));
+            }
+        } else if !is_sync_trailer_line(line) {
+            current.push(line);
+        }
     }
-    format!("{head}\n\n{}\n", kept.join("\n"))
+    if !current.is_empty() {
+        paragraphs.push(current);
+    }
+    if paragraphs.is_empty() {
+        return "(no message)\n".to_string();
+    }
+    let body: Vec<String> = paragraphs.iter().map(|p| p.join("\n")).collect();
+    format!("{}\n", trim_end_js(&body.join("\n\n")))
 }
 
 /// Which of monosplice's sync trailers a commit carries as its *own*.
@@ -403,10 +410,23 @@ mod tests {
             "feat: x\n",
             "feat: x\r\n\r\nbody\r\n",
             "feat: x\n\n\n\nbody\n\nSigned-off-by: A <a@b.c>\n\n\n",
-            "Monosplice-Source: only a subject",
         ] {
             assert_eq!(strip_sync_trailers(msg), msg);
         }
+        // A subject that is itself a sync line is a sync line too; with nothing else left, the
+        // placeholder keeps the claim appended next from being read as the subject.
+        assert_eq!(
+            strip_sync_trailers("Monosplice-Source: only a subject"),
+            "(no message)\n"
+        );
+        assert_eq!(
+            writer_trailer(&append_trailer(
+                &strip_sync_trailers("Monosplice-Source: only a subject"),
+                SOURCE_TRAILER,
+                "m"
+            )),
+            Some(SyncTrailer::Source("m".to_string()))
+        );
     }
 
     #[test]
