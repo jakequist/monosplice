@@ -96,7 +96,8 @@ subrepo, `core/` = the configured subrepo path.
 > the one hop that wrote it; these scenarios keep every hop's trailers out of every other
 > hop's sync state. Tests: `tests/e2e_chained.rs`, `tests/e2e_compat_v1.rs`.
 
-- [x] S176 Compatibility with 1.0.0: an ordinary single-hop history driven by the binary under test (publish, export, import, vendor snapshot, vendor update, vendor patch back) produces byte-identical commits and the same `status --json` as 1.0.0 produced from the same steps (recorded shas, checked in CI); with `MONOSPLICE_V1_BIN` set the same is cross-checked live, and each binary carries on the other's history for another push/pull round and reports it in sync.
+- [x] S170 A replay never forwards sync trailers: middle's export of a commit that arrived from outer carries exactly one `Monosplice-Source` (middle's), outer's sha appears nowhere in the leaf, `Signed-off-by` survives, and middle keeps pushing; outer's import of middle's import carries exactly one `Monosplice-Origin` (the middle commit) and `doctor` passes; `attach --import-history` gives every replayed commit exactly one `Monosplice-Origin`.
+- [x] S176 Compatibility with 1.0.0: an ordinary single-hop history driven by the binary under test (publish, export, import, vendor snapshot, vendor update, vendor patch back) produces byte-identical commits and the same `status --json` as 1.0.0 produced from the same steps (recorded shas, checked in CI); with `MONOSPLICE_V1_BIN` set the same is cross-checked live, and each binary carries on the other's history for another push/pull round and reports it in sync. The one single-hop difference — the export of a conflicted import no longer repeats the import's `Monosplice-Origin` line — is pinned to exactly that line, and each binary carries on from the other's version of it.
 
 ## First contact & adoption (auto-detection matrix)
 

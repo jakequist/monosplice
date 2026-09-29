@@ -18,6 +18,12 @@
 //! `MONOSPLICE_V1_BIN=/path/to/monosplice-1.0.0 cargo test --test e2e_compat_v1 -- --nocapture`,
 //! which prints them.
 //!
+//! One single-hop commit is deliberately *not* byte-identical: the export of a conflicted
+//! import. The import commit carries `Monosplice-Origin`, and 1.0.0 copied it into the public
+//! commit ahead of its own `Monosplice-Source`; that line is no longer forwarded.
+//! [`conflicted_import`] pins the difference to exactly that line and, with
+//! `MONOSPLICE_V1_BIN`, shows each binary carrying on from the other's version of it.
+//!
 //! Histories 1.0.0 wrote across *two* hops — forwarded and doubled trailers — cannot be
 //! reproduced by the current binary at all; those are restored from bundles 1.0.0 produced
 //! (tests/e2e_chained.rs, S171).
@@ -421,4 +427,127 @@ fn cross_checked_against_the_released_v1_binary() {
     assert_in_sync(&s, &new_repos);
     another_round(&s, &new_repos);
     assert_in_sync(&s, &new_repos);
+}
+
+/// A mono edit and a standalone edit to the same line, resolved through the conflict flow and
+/// pushed: the resolution is an import commit (`Monosplice-Origin`) that differs from its
+/// origin, so it must export. Returns (monorepo, core remote, the resolution commit).
+fn conflicted_import(s: &Script) -> (TestRepo, TestRepo, TestRepo, String) {
+    let root = s.root.as_path();
+    make_bare_remote(root, "core");
+    let mono = make_repo(root, "mono");
+    write_config(
+        &mono,
+        &[&subrepo_block(&[
+            ("path", &toml_str("core")),
+            ("remote", &toml_str("../core.git")),
+        ])],
+    );
+    s.commit(&mono, "chore: initial", &[("core/a.txt", "base\n")]);
+    s.ms_ok(&mono, &["attach", "core", "--yes"]);
+
+    let ext = clone_remote(root, "core.git", "core-ext");
+    s.commit_as(
+        &ext,
+        "feat: theirs",
+        &[("a.txt", "theirs\n")],
+        "Ext Contributor",
+        "ext@example.test",
+    );
+    ext.git(&["push", "-q", "origin", "HEAD:main"]);
+    s.commit(&mono, "feat: ours", &[("core/a.txt", "ours\n")]);
+
+    let pull = s.ms(&mono, &["pull"]);
+    assert_ne!(pull.exit_code, 0, "expected a conflict: {}", pull.stdout);
+    mono.write("core/a.txt", "resolved\n");
+    mono.git(&["add", "core/a.txt"]);
+    s.ms_ok(&mono, &["pull", "--continue"]);
+    let resolution = mono.head();
+    s.ms_ok(&mono, &["push"]);
+    (mono, TestRepo::new(root.join("core.git")), ext, resolution)
+}
+
+/// One more round in both directions on the conflicted-import history.
+fn conflicted_round(s: &Script, mono: &TestRepo, ext: &TestRepo) {
+    s.commit(mono, "feat: later", &[("core/later.txt", "later\n")]);
+    s.ms_ok(mono, &["push"]);
+    ext.git(&["pull", "-q", "--ff-only", "origin", "main"]);
+    s.commit_as(
+        ext,
+        "docs: later",
+        &[("LATER.md", "later\n")],
+        "Ext Contributor",
+        "ext@example.test",
+    );
+    ext.git(&["push", "-q", "origin", "HEAD:main"]);
+    s.ms_ok(mono, &["pull"]);
+    let status = s.ms_ok(mono, &["status"]);
+    assert!(status.stdout.contains("in sync"), "{}", status.stdout);
+    s.ms_ok(mono, &["doctor"]);
+}
+
+#[test]
+fn the_export_of_a_conflicted_import_no_longer_forwards_its_origin() {
+    let sb = sandbox();
+    let s = Script::new(monosplice_bin(), sb.path());
+    let (mono, core_pub, _ext, resolution) = conflicted_import(&s);
+
+    let import_message = mono.git(&["log", "-1", "--format=%B", &resolution]);
+    let exported_message = core_pub.git(&["log", "-1", "--format=%B", "main"]);
+    let origin_line = import_message
+        .lines()
+        .find(|l| l.starts_with("Monosplice-Origin: "))
+        .expect("the resolution is an import")
+        .to_string();
+    // 1.0.0 wrote the import's message, its Origin line, then the Source line. Now the Origin
+    // line is gone and nothing else moved.
+    let source_line = format!("Monosplice-Source: {resolution}");
+    assert_eq!(
+        exported_message,
+        import_message.replace(&origin_line, &source_line)
+    );
+    assert_eq!(
+        core_pub.tree_sha("main", None),
+        mono.tree_sha("HEAD", Some("core"))
+    );
+}
+
+#[test]
+fn a_conflicted_import_export_is_read_the_same_by_both_binaries() {
+    let Some(v1) = released_v1_bin() else {
+        eprintln!("skipped: set MONOSPLICE_V1_BIN to a monosplice 1.0.0 binary to run this");
+        return;
+    };
+
+    // 1.0.0 writes the public commit with the forwarded Origin; this version carries on.
+    let sb = sandbox();
+    let s_v1 = Script::new(v1.clone(), sb.path());
+    let (mono, core_pub, ext, resolution) = conflicted_import(&s_v1);
+    let v1_trailers = core_pub.git(&[
+        "log",
+        "-1",
+        "--format=%(trailers:key=Monosplice-Origin,key=Monosplice-Source)",
+        "main",
+    ]);
+    assert!(
+        v1_trailers.contains("Monosplice-Origin") && v1_trailers.contains(&resolution),
+        "{v1_trailers}"
+    );
+    let s = Script {
+        bin: monosplice_bin(),
+        root: sb.path().to_path_buf(),
+        clock: Cell::new(s_v1.clock.get()),
+    };
+    conflicted_round(&s, &mono, &ext);
+
+    // This version writes it without; 1.0.0 carries on.
+    let sb = sandbox();
+    let s_new = Script::new(monosplice_bin(), sb.path());
+    let (mono, _core_pub, ext, _resolution) = conflicted_import(&s_new);
+    let s = Script {
+        bin: v1,
+        root: sb.path().to_path_buf(),
+        clock: Cell::new(s_new.clock.get()),
+    };
+    conflicted_round(&s, &mono, &ext);
 }
