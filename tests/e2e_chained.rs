@@ -799,6 +799,40 @@ fn s183_a_rewrite_message_footer_does_not_carry_an_earlier_hops_line_out() {
     assert_eq!(trailer(&lib, "main", SOURCE), vec![mono.head()]);
 }
 
+/// A hook that reshapes every line (here: quotes it) would carry an earlier hop's line past a
+/// strip that only ran afterwards — the line no longer starts with the key. The strip before the
+/// hook is what catches it.
+#[test]
+fn s183_a_rewrite_message_hook_never_sees_an_earlier_hops_line() {
+    let sb = sandbox();
+    let root = sb.path();
+    let lib_dir = make_bare_remote(root, "lib");
+    let mono = make_repo(root, "mono");
+    write_config(
+        &mono,
+        &[&subrepo_block(&[
+            ("name", &toml_str("lib")),
+            ("path", &toml_str("lib")),
+            ("remote", &toml_str(&lib_dir)),
+            ("rewrite-message", &toml_str("sed 's/^/> /'")),
+        ])],
+    );
+    mono.commit("lib v1", &[("lib/a.txt", Some("v1\n"))]);
+    run_ok(&mono.dir, &["attach", "lib", "--yes"]);
+    commit_verbatim(
+        &mono,
+        &format!("outer: patch\n\n{SOURCE}: {PRIV}\n"),
+        "lib/n.txt",
+        "x\n",
+    );
+    run_ok(&mono.dir, &["push"]);
+    let lib = TestRepo::new(&lib_dir);
+    let body = lib.git(&["log", "-1", "--format=%B", "main"]);
+    assert!(!body.contains(PRIV), "leaked:\n{body}");
+    assert!(body.starts_with("> outer: patch"), "{body}");
+    assert_eq!(trailer(&lib, "main", SOURCE), vec![mono.head()]);
+}
+
 /// The same on import: a standalone commit whose body carries an earlier hop's line anywhere
 /// lands in the monorepo with none of it, and with exactly one Origin.
 #[test]

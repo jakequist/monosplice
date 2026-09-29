@@ -218,6 +218,44 @@ fn s177_a_cherry_picked_reland_does_not_hide_the_fix_before_it() {
     );
 }
 
+/// Our own exports stay ours when `exclude` changes after them: their trees no longer match what
+/// the named commits publish today, but each sits on work both sides agree on (1.0.0's reading).
+/// Reading them as copied lines instead would re-import every export and replay history.
+#[test]
+fn s177_an_exclude_added_after_the_exports_leaves_them_ours() {
+    let p = publisher(Some(P_ID));
+    p.mono
+        .commit("docs: notes", &[("lib/notes.md", Some("notes\n"))]);
+    run_ok(&p.mono.dir, &["push"]);
+    p.mono.commit("feat: b", &[("lib/b.txt", Some("b\n"))]);
+    run_ok(&p.mono.dir, &["push"]);
+    let before = p.lib.git(&["rev-parse", "main"]);
+
+    write_config_with_id(
+        &p.mono,
+        P_ID,
+        &[&subrepo_block(&[
+            ("name", &toml_str("lib")),
+            ("path", &toml_str("lib")),
+            ("remote", &toml_str(&p.lib_dir)),
+            ("exclude", "[\"notes.md\"]"),
+        ])],
+    );
+    p.mono.commit("chore: stop publishing notes", &[]);
+
+    let status = run_ok(&p.mono.dir, &["status"]);
+    assert!(!status.stdout.contains("to pull"), "{}", status.stdout);
+    assert!(!status.stdout.contains("stopped"), "{}", status.stdout);
+    run_ok(&p.mono.dir, &["doctor"]);
+    p.mono.commit("feat: c", &[("lib/c.txt", Some("c\n"))]);
+    let push = run_ok(&p.mono.dir, &["push"]);
+    assert!(push.stdout.contains("exported 1 commit"), "{}", push.stdout);
+    assert_eq!(p.lib.git(&["rev-parse", "main~1"]), before);
+    let files = p.lib_files();
+    assert!(!files.contains(&"notes.md".to_string()), "{files:?}");
+    assert!(files.contains(&"c.txt".to_string()), "{files:?}");
+}
+
 // ---------------------------------------------------------------------------------------------
 // S178: an export of ours that this clone cannot see stops (d8, d9).
 // ---------------------------------------------------------------------------------------------
@@ -278,6 +316,16 @@ fn own_export_lost(variant: &str) {
     );
     assert_eq!(fresh.head(), before, "{variant}: nothing may be imported");
     run_fails(&fresh.dir, &["pull", "--dry-run"]);
+    if variant == "drop" {
+        // Nothing to push or pull by the counts, but a tag would name a state nobody can vouch for.
+        let tag = run_fails(&fresh.dir, &["tag", "lib", "v1"]);
+        assert!(tag.stderr.contains(&lost[0]), "{}", tag.stderr);
+        assert!(
+            lib.git_try(&["rev-parse", "-q", "--verify", "refs/tags/v1"])
+                .exit_code
+                != 0
+        );
+    }
     fresh.commit("kacho: more", &[("vendor/lib/b.txt", Some("b\n"))]);
     let push = run_fails(&fresh.dir, &["push"]);
     assert!(push.stderr.contains(&lost[0]), "{}", push.stderr);
