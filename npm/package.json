@@ -1,6 +1,6 @@
 {
   "name": "monosplice",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Ergonomic bidirectional sync between a monorepo and the standalone repos it splices out. Submodule accuracy without submodule pain.",
   "keywords": [
     "git",
