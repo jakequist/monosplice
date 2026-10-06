@@ -76,7 +76,7 @@ brain and submodule-free ergonomics."
 ## Releasing & repo operations
 
 - Repo: `github.com/jakequist/monosplice` (public; renamed from `monolith` — old URLs
-  redirect). Local checkout: `/home/jake/monosplice`.
+  redirect). Local checkouts: `/home/jake/monosplice` (Linux), `/Users/jake/monosplice` (Mac).
 - **Distribution: GitHub Releases is primary.** The release assets are five per-target
   tarballs, `monosplice-X.Y.Z-<target>.tar.gz` (x86_64/aarch64 linux-musl, x86_64/aarch64
   apple-darwin, x86_64-pc-windows-msvc), each holding one `monosplice` binary, plus
@@ -90,17 +90,24 @@ brain and submodule-free ergonomics."
   on npmjs.com is exactly `release.yml` in this repo; renaming that file breaks publishing
   until the registration is updated.
 - **To release:** bump `version` in **Cargo.toml AND npm/package.json** (they must match the
-  tag), commit, `git tag vX.Y.Z`, push main + the tag. release.yml verifies tag == crate
-  version, runs the full suite, cross-builds the five targets, creates the GitHub release
+  tag) and the pinned string in `tests/e2e_help.rs` (`version_prints_the_crate_version`).
+  CI runs clippy on the *latest stable* toolchain, so a new release can trip lints a stale
+  local toolchain misses: `rustup update stable` first, or push main and wait for a green
+  `ci.yml` before tagging. Then commit, `git tag vX.Y.Z`, push main + the tag. release.yml
+  verifies tag == crate version, runs the full suite, cross-builds the five targets, creates the GitHub release
   with the tarballs, and publishes the npm shim. Nothing is ever published by hand.
 - **If a release run fails partway, do NOT re-run it** — `gh release create` is not
   idempotent and npm refuses to republish a version. Instead: fix the problem, then
   `gh release delete vX.Y.Z --cleanup-tag --yes`, re-tag the fixed commit, push the tag.
+  If it failed in `verify` (before any release exists), just delete the remote tag
+  (`git push origin :refs/tags/vX.Y.Z`), re-tag, and push.
 - The release job needs node ≥ 22 (`npm@latest` for OIDC dropped node 20 support) and
   workflow-level `permissions: id-token: write`.
-- GitHub auth from this machine: `.env` (gitignored, never print/commit it) holds
+- GitHub auth on the Linux box: `.env` (gitignored, never print/commit it) holds
   `GH_TOKEN`. Load with `set -a; source .env; set +a` for `gh`; pushes work via
   `git -c credential.helper='!f() { echo "username=jakequist"; echo "password=$GH_TOKEN"; }; f' push …`.
+  On the Mac there is no `.env`: `gh` is already authenticated and `origin` is SSH, so a
+  plain `git push` works.
 - CI (`ci.yml`) builds and runs the full suite on every push/PR. Both workflows live in
   `.github/workflows/`.
 
