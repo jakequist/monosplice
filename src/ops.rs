@@ -218,13 +218,14 @@ pub fn report_import_failure(
 ) -> SubrepoFailure {
     match err {
         ImportError::Conflict(conflict) => SubrepoFailure::halting(format!(
-            "{}: importing {} conflicts with local changes.
+            "{}: importing {} into {}/ conflicted.
 Conflicted files:
 {}
 Edit each file to resolve the markers, `git add` it, then run:
 {}",
             subrepo.name,
             short(&conflict.pub_sha),
+            subrepo.path,
             conflict
                 .conflicts
                 .iter()
@@ -264,6 +265,7 @@ pub fn import_subrepo(
         root,
         subrepo,
         &view.unreflected_pub,
+        view.import_base.as_deref(),
         &mut |message| warn(&message),
         None,
     )
@@ -757,7 +759,7 @@ mod tests {
         assert!(failure.halt, "a written sequencer stops the whole run");
         assert_eq!(
             failure.message,
-            "core: importing 0123456789 conflicts with local changes.\nConflicted files:\n  core/a.ts\n  core/b.ts\nEdit each file to resolve the markers, `git add` it, then run:\n  monosplice pull --continue\nTo abandon the import instead, restoring the monorepo to its pre-pull state:\n  monosplice pull --abort"
+            "core: importing 0123456789 into core/ conflicted.\nConflicted files:\n  core/a.ts\n  core/b.ts\nEdit each file to resolve the markers, `git add` it, then run:\n  monosplice pull --continue\nTo abandon the import instead, restoring the monorepo to its pre-pull state:\n  monosplice pull --abort"
         );
     }
 

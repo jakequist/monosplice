@@ -10,8 +10,8 @@ use std::path::Path;
 use crate::config::ResolvedSubrepo;
 use crate::core::filter::anchor_subtree;
 use crate::core::git::{
-    existing_commits, fetch_branch, git, git_with, ls_remote_branch, missing_objects, rev_list,
-    rev_parse, trailer_values, GitError, GitOpts,
+    existing_commits, fetch_branch, git, git_ok, git_with, ls_remote_branch, missing_objects,
+    rev_list, rev_parse, trailer_values, GitError, GitOpts,
 };
 use crate::core::trailers::{ORIGIN_TRAILER, SOURCE_TRAILER};
 
@@ -116,6 +116,12 @@ pub struct SyncView {
     pub last_exported_mono: Option<String>,
     /// Public commits that are neither our exports nor already reflected (oldest first).
     pub unreflected_pub: Vec<String>,
+    /// Diff base for the first of [`SyncView::unreflected_pub`]: the newest imported pub
+    /// commit, whenever that step descends from it. In linear history this is the step's own
+    /// first parent; it differs when upstream's first-parent line bypassed the import. `None`
+    /// (nothing imported, nothing descends from it, or the first step is our own export)
+    /// means every step diffs against its first parent.
+    pub import_base: Option<String>,
     /// `Monosplice-Source` trailers naming monorepo commits this clone does not have, found on
     /// or above the newest public commit whose trailer *does* resolve. Nothing above the
     /// mapping's newest readable point can be checked, so export refuses while any exist.
@@ -144,6 +150,7 @@ pub fn unpublished_view(name: &str) -> SyncView {
         export_base: None,
         last_exported_mono: None,
         unreflected_pub: Vec::new(),
+        import_base: None,
         broken_source_refs: Vec::new(),
         superseded_source_refs: Vec::new(),
         related: false,
@@ -244,27 +251,59 @@ fn find_export_anchor(
     Ok((None, related))
 }
 
-/// Public commits the monorepo has not seen. Ancestry, not per-commit bookkeeping: a shallow
-/// snapshot `attach` records only the pub head as imported, and every ancestor of a reflected
-/// commit is reflected by construction. Our own exports drop out by trailer.
+/// Public commits the monorepo has not seen, as the import steps `pull` will replay. Ancestry,
+/// not per-commit bookkeeping: a shallow snapshot `attach` records only the pub head as
+/// imported, and every ancestor of a reflected commit is reflected by construction. Our own
+/// exports drop out by trailer.
+///
+/// The walk follows pub's first-parent line only. Each step is replayed as its diff against
+/// its first parent, so a merge must be one step whose diff is upstream's own resolved result;
+/// replaying a side branch's commits individually would apply them on top of changes they
+/// never saw, and then the merge would apply them a second time. Nothing is lost by skipping
+/// them: once the merge is imported, its Origin trailer reflects the side branch by ancestry.
+///
+/// The first-parent line can bypass `last_reflected` (a side branch merged main in and main
+/// fast-forwarded to it): its leading steps never saw that already-imported commit, so they
+/// are dropped, and the first kept step is diffed against `last_reflected` — returned as the
+/// base override — because its own first parent may predate it and the diff would re-apply
+/// imported work. Containment is monotone along the line, so the scan stops at the first step
+/// that contains it; when none does, the line is replayed as-is. No override when that step
+/// is our own export: it is filtered out, and the next step must diff against it.
 fn find_unreflected_pub(
     root: &Path,
     tracking_ref: &str,
     imported_pub_shas: &HashSet<String>,
     source_by_pub: &HashMap<String, Vec<String>>,
-) -> Result<Vec<String>, GitError> {
+    last_reflected: Option<&str>,
+) -> Result<(Vec<String>, Option<String>), GitError> {
     // A forged or force-pushed-away Origin value would abort the whole rev-list, so only
     // values that resolve to a commit here are allowed to negate anything.
     let candidates: Vec<String> = imported_pub_shas.iter().cloned().collect();
     let reflected = existing_commits(root, &candidates)?;
     let out = if reflected.is_empty() {
-        git(root, &["rev-list", "--reverse", tracking_ref])?
+        git(
+            root,
+            &[
+                "rev-list",
+                "--reverse",
+                "--topo-order",
+                "--first-parent",
+                tracking_ref,
+            ],
+        )?
     } else {
         // --stdin instead of argv: pub histories can carry thousands of reflected commits.
         let input: String = reflected.iter().map(|sha| format!("^{sha}\n")).collect();
         git_with(
             root,
-            &["rev-list", "--reverse", tracking_ref, "--stdin"],
+            &[
+                "rev-list",
+                "--reverse",
+                "--topo-order",
+                "--first-parent",
+                tracking_ref,
+                "--stdin",
+            ],
             GitOpts {
                 input: Some(input.as_bytes()),
                 ..Default::default()
@@ -272,13 +311,48 @@ fn find_unreflected_pub(
         )?
     };
     if out.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
-    Ok(out
-        .split('\n')
+    let mut line: Vec<&str> = out.split('\n').collect();
+    let mut import_base = None;
+    if let Some(reflected) = last_reflected {
+        let first_containing = line
+            .iter()
+            .position(|sha| git_ok(root, &["merge-base", "--is-ancestor", reflected, sha]));
+        if let Some(idx) = first_containing {
+            line.drain(..idx);
+            if !source_by_pub.contains_key(line[0]) {
+                import_base = Some(reflected.to_string());
+            }
+        }
+    }
+    let steps = line
+        .into_iter()
         .filter(|sha| !source_by_pub.contains_key(*sha))
         .map(str::to_string)
-        .collect())
+        .collect();
+    Ok((steps, import_base))
+}
+
+/// The pub commit named by the newest `Monosplice-Origin` on the HEAD walk that pub still
+/// contains — what the monorepo's copy of the subrepo was last synchronised to.
+fn find_last_reflected(
+    root: &Path,
+    origin_by_mono: &HashMap<String, Vec<String>>,
+    pub_ancestors: &HashSet<String>,
+) -> Result<Option<String>, GitError> {
+    if origin_by_mono.is_empty() {
+        return Ok(None);
+    }
+    for mono_sha in rev_list(root, &["HEAD"])? {
+        let Some(values) = origin_by_mono.get(&mono_sha) else {
+            continue;
+        };
+        if let Some(pub_sha) = values.iter().find(|v| pub_ancestors.contains(*v)) {
+            return Ok(Some(pub_sha.clone()));
+        }
+    }
+    Ok(None)
 }
 
 /// Derive every sync cursor from trailers. There is no state file: this runs on each
@@ -388,8 +462,14 @@ pub fn load_sync_view(
         &pub_ancestors,
     )?;
 
-    let unreflected_pub =
-        find_unreflected_pub(root, &tracking_ref, &imported_pub_shas, &source_by_pub)?;
+    let last_reflected = find_last_reflected(root, &origin_by_mono, &pub_ancestors)?;
+    let (unreflected_pub, import_base) = find_unreflected_pub(
+        root,
+        &tracking_ref,
+        &imported_pub_shas,
+        &source_by_pub,
+        last_reflected.as_deref(),
+    )?;
 
     Ok(SyncView {
         tracking_ref,
@@ -400,6 +480,7 @@ pub fn load_sync_view(
         export_base,
         last_exported_mono,
         unreflected_pub,
+        import_base,
         broken_source_refs,
         superseded_source_refs,
         related,
@@ -814,6 +895,62 @@ mod tests {
         f.commit(&format!("import\n\nMonosplice-Origin: {p2}\n"));
         let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
         assert_eq!(view.unreflected_pub, vec![p3.clone()]);
+    }
+
+    #[test]
+    fn the_first_step_is_diffed_against_the_last_import_even_when_the_line_bypassed_it() {
+        let f = Fixture::new("bypass");
+        let blob = |text: &str| {
+            f.sh(&format!(
+                "printf {} | git hash-object -w --stdin",
+                shq(text)
+            ))
+        };
+        let tree = |entries: &[(&str, &str)]| {
+            let lines: String = entries
+                .iter()
+                .map(|(name, sha)| format!("100644 blob {sha}\\t{name}\\n"))
+                .collect();
+            f.sh(&format!("printf '{lines}' | git mktree"))
+        };
+        let base = blob("base\n");
+        let fix = blob("fix\n");
+        let feat = blob("feat\n");
+        let init = f.push_pub(&tree(&[("a.txt", &base)]), None, "init\n");
+        let a1 = f.push_pub(
+            &tree(&[("a.txt", &base), ("fix.txt", &fix)]),
+            Some(&init),
+            "fix\n",
+        );
+        f.commit(&format!("import fix\n\nMonosplice-Origin: {a1}\n"));
+
+        // Nothing past the import: no steps, no base.
+        let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
+        assert!(view.unreflected_pub.is_empty());
+        assert_eq!(view.import_base, None);
+
+        let f1 = f.push_pub(
+            &tree(&[("a.txt", &base), ("feat.txt", &feat)]),
+            Some(&init),
+            "feat\n",
+        );
+        let merged = tree(&[("a.txt", &base), ("feat.txt", &feat), ("fix.txt", &fix)]);
+        let m = f.push_pub(&merged, Some(&format!("{f1} -p {a1}")), "merge main\n");
+
+        // first-parent m ^a1 = [f1, m]; f1 never saw a1, so only m remains, diffed against a1.
+        let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
+        assert_eq!(view.unreflected_pub, vec![m.clone()]);
+        assert_eq!(view.import_base.as_deref(), Some(a1.as_str()));
+
+        let p = f.push_pub(&merged, Some(&m), "after\n");
+        f.commit(&format!("import merge\n\nMonosplice-Origin: {m}\n"));
+        let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
+        assert_eq!(view.unreflected_pub, vec![p]);
+        assert_eq!(
+            view.import_base.as_deref(),
+            Some(m.as_str()),
+            "== p's first parent"
+        );
     }
 
     #[test]

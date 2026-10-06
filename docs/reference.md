@@ -477,7 +477,7 @@ Imports are the only operation that touches your working tree, because a conflic
 
 ```console
 $ monosplice pull
-Error: core: importing 4a91c2f0b1 conflicts with local changes.
+Error: core: importing 4a91c2f0b1 into core/ conflicted.
 Conflicted files:
   core/src/index.ts
 Edit each file to resolve the markers, `git add` it, then run:
@@ -487,7 +487,9 @@ To abandon the import instead, restoring the monorepo to its pre-pull state:
 ```
 
 Each incoming commit is applied with `git apply --3way --index`, so non-conflicting concurrent
-edits merge silently. On a real conflict, monosplice leaves standard conflict markers in your
+edits merge silently. Imports follow the standalone repo's first-parent line: a merge arrives as
+one commit carrying upstream's own resolution, and the side branch it merged is never replayed
+on its own. On a real conflict, monosplice leaves standard conflict markers in your
 working tree and writes a sequencer file under `.git/monosplice/` — a transient record of which
 commit we were on, what is left, where the run started and what it has committed so far,
 exactly like `.git/rebase-merge`. It is never committed and never part of your project.

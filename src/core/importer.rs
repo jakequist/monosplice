@@ -241,15 +241,20 @@ enum ImportStep {
     Conflicts(Vec<String>),
 }
 
-/// Replay one standalone-repo commit onto the work tree. Returns the unmerged paths when the
-/// three-way apply conflicted, or the monorepo commit it created when it applied.
+/// Replay one standalone-repo commit onto the work tree, as its diff against `base` or, when
+/// none is given, its first parent. Returns the unmerged paths when the three-way apply
+/// conflicted, or the monorepo commit it created when it applied.
 fn import_one(
     root: &Path,
     subrepo: &ResolvedSubrepo,
     meta: &PullSequencerCommit,
+    base: Option<&str>,
     warn: &mut dyn FnMut(String),
 ) -> Result<ImportStep, ImportError> {
-    let base = diff_base(root, &meta.sha)?;
+    let base = match base {
+        Some(b) => b.to_string(),
+        None => diff_base(root, &meta.sha)?,
+    };
     let patch = git_buffer(
         root,
         &["diff-tree", "--binary", "-M", "-p", &base, &meta.sha],
@@ -308,12 +313,14 @@ fn read_sequencer_commit(root: &Path, sha: &str) -> Result<PullSequencerCommit, 
 }
 
 /// Replay standalone-repo commits (oldest first) into the monorepo, stopping at the first
-/// conflict. `run` carries the provenance of an already-started pull across `--continue`; left
-/// out, this call *is* the start of the run.
+/// conflict. `first_base` overrides the diff base of the first candidate only (see
+/// `SyncView::import_base`). `run` carries the provenance of an already-started pull across
+/// `--continue`; left out, this call *is* the start of the run.
 pub fn run_import(
     root: &Path,
     subrepo: &ResolvedSubrepo,
     candidates: &[String],
+    first_base: Option<&str>,
     warn: &mut dyn FnMut(String),
     run: Option<RunProvenance>,
 ) -> Result<ImportOutcome, ImportError> {
@@ -324,7 +331,8 @@ pub fn run_import(
     let mut imported: Vec<String> = Vec::new();
     for (idx, sha) in candidates.iter().enumerate() {
         let meta = read_sequencer_commit(root, sha)?;
-        match import_one(root, subrepo, &meta, warn)? {
+        let base = if idx == 0 { first_base } else { None };
+        match import_one(root, subrepo, &meta, base, warn)? {
             ImportStep::Conflicts(conflicts) => {
                 let state_path = write_sequencer(
                     root,
@@ -370,7 +378,7 @@ pub fn continue_import(
         start_head: state.start_head.clone().unwrap_or(sha),
         created,
     };
-    let rest = run_import(root, subrepo, &state.remaining, warn, Some(run))?;
+    let rest = run_import(root, subrepo, &state.remaining, None, warn, Some(run))?;
     let mut imported = vec![state.current.sha.clone()];
     imported.extend(rest.imported);
     Ok(ImportOutcome { imported })
@@ -764,8 +772,15 @@ mod tests {
 
         let mut warnings = collector();
         let s = subrepo(&[]);
-        let out = run_import(&mono, &s, &candidates, &mut |m| warnings.push(m), None)
-            .expect("imports cleanly");
+        let out = run_import(
+            &mono,
+            &s,
+            &candidates,
+            None,
+            &mut |m| warnings.push(m),
+            None,
+        )
+        .expect("imports cleanly");
         assert_eq!(out.imported, vec![p1.clone(), p2.clone()]);
         assert!(warnings.is_empty());
 
@@ -820,7 +835,7 @@ mod tests {
         assert_eq!(diff_base(&pubr, &p1).unwrap(), EMPTY_TREE);
 
         let candidates = fetch_pub(&mono, &pubr);
-        let out = run_import(&mono, &subrepo(&[]), &candidates, &mut |_| {}, None).unwrap();
+        let out = run_import(&mono, &subrepo(&[]), &candidates, None, &mut |_| {}, None).unwrap();
         assert_eq!(out.imported, vec![p1]);
         assert_eq!(read(&mono, "core/a.txt"), "a\n");
     }
@@ -840,7 +855,15 @@ mod tests {
         let candidates = fetch_pub(&mono, &pubr);
         let s = subrepo(&["**/*.secret"]);
         let mut warnings = collector();
-        run_import(&mono, &s, &candidates, &mut |m| warnings.push(m), None).unwrap();
+        run_import(
+            &mono,
+            &s,
+            &candidates,
+            None,
+            &mut |m| warnings.push(m),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(
@@ -891,7 +914,7 @@ Rename the file or drop the pattern from `exclude` if you want to keep it in the
         let (mono, candidates, start_head) = diverged_fixture(&sb, false);
         let s = subrepo(&[]);
 
-        let err = run_import(&mono, &s, &candidates, &mut |_| {}, None).unwrap_err();
+        let err = run_import(&mono, &s, &candidates, None, &mut |_| {}, None).unwrap_err();
         let ImportError::Conflict(c) = err else {
             panic!("expected a conflict, got {err:?}");
         };
@@ -951,7 +974,7 @@ Rename the file or drop the pattern from `exclude` if you want to keep it in the
         let a_before = read(&mono, "core/a.txt");
         let z_before = read(&mono, "core/z.txt");
 
-        let err = run_import(&mono, &s, &candidates, &mut |_| {}, None).unwrap_err();
+        let err = run_import(&mono, &s, &candidates, None, &mut |_| {}, None).unwrap_err();
         assert!(matches!(err, ImportError::Conflict(_)));
         let first = read_sequencer(&mono).expect("sequencer");
 
@@ -992,7 +1015,7 @@ Rename the file or drop the pattern from `exclude` if you want to keep it in the
         let (mono, candidates, start_head) = diverged_fixture(&sb, true);
         let s = subrepo(&[]);
 
-        let err = run_import(&mono, &s, &candidates, &mut |_| {}, None).unwrap_err();
+        let err = run_import(&mono, &s, &candidates, None, &mut |_| {}, None).unwrap_err();
         assert!(matches!(err, ImportError::Conflict(_)));
         let first = read_sequencer(&mono).expect("sequencer");
         write(&mono, "core/a.txt", "resolved\n");
@@ -1029,7 +1052,7 @@ Rename the file or drop the pattern from `exclude` if you want to keep it in the
         let sb = Sandbox::new("abort-no-provenance");
         let (mono, candidates, start_head) = diverged_fixture(&sb, false);
         let s = subrepo(&[]);
-        let err = run_import(&mono, &s, &candidates, &mut |_| {}, None).unwrap_err();
+        let err = run_import(&mono, &s, &candidates, None, &mut |_| {}, None).unwrap_err();
         assert!(matches!(err, ImportError::Conflict(_)));
 
         // A sequencer from before the provenance fields existed.
@@ -1067,7 +1090,7 @@ Rename the file or drop the pattern from `exclude` if you want to keep it in the
 
         let candidates = fetch_pub(&mono, &pubr);
         let s = subrepo(&[]);
-        let err = run_import(&mono, &s, &candidates[1..], &mut |_| {}, None).unwrap_err();
+        let err = run_import(&mono, &s, &candidates[1..], None, &mut |_| {}, None).unwrap_err();
         assert!(matches!(err, ImportError::Conflict(_)));
         assert!(mono.join("core/brand-new.txt").exists());
 

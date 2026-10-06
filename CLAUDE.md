@@ -26,9 +26,12 @@ brain and submodule-free ergonomics."
     with a naive version a conflicted import would silently become the base and lose its
     resolution.
   - **Reflection is ancestry-based.** Unimported pub commits are
-    `rev-list <pubHead> --not <each imported sha>` (fed via `--stdin`), minus our own exports.
-    Every ancestor of a reflected commit is reflected; a one-commit `adopt` of a 200-commit
-    repo must never read as "200 to pull".
+    `rev-list --first-parent <pubHead> --not <each imported sha>` (fed via `--stdin`), minus
+    our own exports. Every ancestor of a reflected commit is reflected; a one-commit `adopt`
+    of a 200-commit repo must never read as "200 to pull".
+  - **Imports follow pub's first-parent line.** A merge is one import step (its diff against
+    its first parent is upstream's own resolution); side-branch commits are never replayed on
+    their own — doing so re-creates conflicts upstream already resolved.
 - **Triangular mode: upstream decides, the fork is disposable.** When a subrepo configures
   `upstream`, every sync decision (fetch, anchors, unreflected, ahead/behind) is made against
   upstream and *only* upstream — the fork is never consulted for imports. `remote` is the push

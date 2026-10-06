@@ -284,7 +284,7 @@ fn snapshot_into_empty_path(
     args: &AttachArgs,
 ) -> Result<usize, Failure> {
     if args.import_history {
-        return replay_standalone_history(root, entry, &view.unreflected_pub);
+        return replay_standalone_history(root, entry, view);
     }
 
     let pub_tree = tree_of(root, pub_head)?;
@@ -560,7 +560,7 @@ fn attach_to_history(
     if args.import_history {
         commit_entry(project, entry, &format!("{retry} --import-history"))?;
         let view = load_view(root, entry, SyncViewOptions::default()).map_err(from_subrepo)?;
-        replayed = replay_standalone_history(root, entry, &view.unreflected_pub)?;
+        replayed = replay_standalone_history(root, entry, &view)?;
     } else {
         insert_entry(project, entry, &format!("monosplice attach {}", entry.path))?;
         let config_path = project.config_path.display().to_string();
@@ -649,10 +649,17 @@ fn commit_entry(
 fn replay_standalone_history(
     root: &Path,
     entry: &ResolvedSubrepo,
-    candidates: &[String],
+    view: &SyncView,
 ) -> Result<usize, Failure> {
-    let result = run_import(root, entry, candidates, &mut |message| warn(&message), None)
-        .map_err(|err| from_subrepo(report_import_failure(entry, err, None)))?;
+    let result = run_import(
+        root,
+        entry,
+        &view.unreflected_pub,
+        view.import_base.as_deref(),
+        &mut |message| warn(&message),
+        None,
+    )
+    .map_err(|err| from_subrepo(report_import_failure(entry, err, None)))?;
     Ok(result.imported.len())
 }
 

@@ -709,3 +709,435 @@ fn pull_tells_the_user_to_publish_when_the_public_branch_does_not_exist() {
         res.stderr
     );
 }
+
+const CL_BASE: &str = "# CL\n## Unreleased\n";
+const CL_FEAT: &str = "# CL\n## Unreleased\n- feat A\n";
+const CL_FIX: &str = "# CL\n## Unreleased\n- fix B\n";
+const CL_MERGED: &str = "# CL\n## Unreleased\n- fix B\n- feat A\n";
+
+/// Seed, then give pub a CHANGELOG (`init`) that the monorepo has already imported — the
+/// "attached at `init`, no local changes" starting point.
+fn seeded_at_changelog_init() -> Seeded {
+    let s = seeded_with_external();
+    ext_commit(&s.ext, "init", &[("CHANGELOG.md", Some(CL_BASE))]);
+    s.ext.git(&["push", "origin", "main"]);
+    let res = run_monosplice(&s.fixture.mono.dir, &["pull"]);
+    assert_eq!(res.exit_code, 0, "stderr: {}", res.stderr);
+    assert_eq!(s.fixture.mono.read("core/CHANGELOG.md"), CL_BASE);
+    s
+}
+
+/// Upstream history with an overlapping merge: `feat` and `main` both add a line under
+/// "## Unreleased", and the merge resolves by hand. Returns the merge sha (pushed).
+fn push_overlapping_merge(ext: &TestRepo) -> String {
+    ext.git(&["checkout", "-b", "feat"]);
+    ext_commit(ext, "featA", &[("CHANGELOG.md", Some(CL_FEAT))]);
+    ext.git(&["checkout", "main"]);
+    ext_commit(ext, "fixB", &[("CHANGELOG.md", Some(CL_FIX))]);
+    let merge = ext.merge(
+        "feat",
+        "Merge branch 'feat'",
+        &[("CHANGELOG.md", Some(CL_MERGED))],
+    );
+    ext.git(&["push", "origin", "main"]);
+    merge
+}
+
+fn commit_count(repo: &TestRepo) -> usize {
+    repo.subjects("HEAD").len()
+}
+
+/// S167: an upstream merge whose branches touched the same lines imports cleanly when the
+/// monorepo has no local changes — the merge is one step carrying upstream's own resolution,
+/// and the side branch is never replayed on its own.
+#[test]
+fn s167_overlapping_upstream_merge_imports_along_the_first_parent_line() {
+    let s = seeded_at_changelog_init();
+    let mono = &s.fixture.mono;
+    let merge = push_overlapping_merge(&s.ext);
+
+    let before = commit_count(mono);
+    let res = run_monosplice(&mono.dir, &["pull"]);
+    assert_eq!(
+        res.exit_code, 0,
+        "stdout: {}\nstderr: {}",
+        res.stdout, res.stderr
+    );
+    assert!(
+        res.stdout.contains("imported 2 commit"),
+        "stdout: {}",
+        res.stdout
+    );
+    assert_eq!(
+        commit_count(mono) - before,
+        2,
+        "fixB + the merge, nothing else"
+    );
+    let subjects = mono.subjects("HEAD");
+    assert_eq!(
+        subjects[subjects.len() - 2..],
+        ["fixB", "Merge branch 'feat'"]
+    );
+    assert!(!mono.exists(SEQUENCER));
+
+    assert_eq!(
+        mono.tree_sha("HEAD", Some("core")),
+        s.pub_repo.tree_sha("HEAD", None)
+    );
+    assert_eq!(mono.read("core/CHANGELOG.md"), CL_MERGED);
+    let messages = mono.messages("HEAD");
+    assert!(
+        messages
+            .last()
+            .is_some_and(|m| m.contains(&format!("Monosplice-Origin: {merge}"))),
+        "messages: {messages:?}"
+    );
+
+    let status = run_monosplice(&mono.dir, &["status"]);
+    assert_eq!(status.exit_code, 0, "stderr: {}", status.stderr);
+    assert!(
+        status.stdout.contains("core: in sync"),
+        "stdout: {}",
+        status.stdout
+    );
+    let head = mono.head();
+    let again = run_monosplice(&mono.dir, &["pull"]);
+    assert_eq!(again.exit_code, 0, "stderr: {}", again.stderr);
+    assert!(
+        again.stdout.contains("up to date"),
+        "stdout: {}",
+        again.stdout
+    );
+    assert_eq!(mono.head(), head);
+}
+
+/// S168: the same overlapping merge imports cleanly when the monorepo has an unrelated local
+/// edit in the subrepo — both the local edit and upstream's merged result survive.
+#[test]
+fn s168_overlapping_upstream_merge_imports_beside_an_unrelated_local_edit() {
+    let s = seeded_at_changelog_init();
+    let mono = &s.fixture.mono;
+    mono.commit(
+        "feat(core): local edit",
+        &[(
+            "core/src/index.ts",
+            Some("export const hello = () => \"hi\"\n"),
+        )],
+    );
+    let merge = push_overlapping_merge(&s.ext);
+
+    let res = run_monosplice(&mono.dir, &["pull"]);
+    assert_eq!(
+        res.exit_code, 0,
+        "stdout: {}\nstderr: {}",
+        res.stdout, res.stderr
+    );
+    assert!(!mono.exists(SEQUENCER));
+    assert_eq!(mono.read("core/CHANGELOG.md"), CL_MERGED);
+    assert_eq!(
+        mono.read("core/src/index.ts"),
+        "export const hello = () => \"hi\"\n"
+    );
+    let messages = mono.messages("HEAD");
+    assert!(
+        messages
+            .last()
+            .is_some_and(|m| m.contains(&format!("Monosplice-Origin: {merge}"))),
+        "messages: {messages:?}"
+    );
+}
+
+/// A merge of a side branch touching disjoint files imports as one step, and a later pull
+/// after upstream builds on top of the merge replays only the new commits — the side branch
+/// counts as reflected through the merge's ancestry.
+#[test]
+fn disjoint_side_branch_merge_imports_once_and_later_pulls_replay_only_new_commits() {
+    let s = seeded_with_external();
+    let mono = &s.fixture.mono;
+    let ext = &s.ext;
+
+    ext.git(&["checkout", "-b", "feat"]);
+    ext_commit(ext, "feat: one", &[("feat1.txt", Some("f1\n"))]);
+    ext_commit(ext, "feat: two", &[("feat2.txt", Some("f2\n"))]);
+    ext.git(&["checkout", "main"]);
+    ext_commit(ext, "fix: main", &[("fix.txt", Some("x\n"))]);
+    let merge = ext.merge("feat", "Merge branch 'feat'", &[]);
+    ext.git(&["push", "origin", "main"]);
+
+    let res = run_monosplice(&mono.dir, &["pull"]);
+    assert_eq!(
+        res.exit_code, 0,
+        "stdout: {}\nstderr: {}",
+        res.stdout, res.stderr
+    );
+    assert!(
+        res.stdout.contains("imported 2 commit"),
+        "stdout: {}",
+        res.stdout
+    );
+    assert_eq!(
+        mono.tree_sha("HEAD", Some("core")),
+        s.pub_repo.tree_sha(&merge, None)
+    );
+
+    ext_commit(ext, "after: one", &[("after1.txt", Some("a1\n"))]);
+    let tip = ext_commit(ext, "after: two", &[("after2.txt", Some("a2\n"))]);
+    ext.git(&["push", "origin", "main"]);
+
+    let status = run_monosplice(&mono.dir, &["status"]);
+    assert!(
+        status.stdout.contains("core: 2 to pull"),
+        "stdout: {}",
+        status.stdout
+    );
+
+    let before = commit_count(mono);
+    let res = run_monosplice(&mono.dir, &["pull"]);
+    assert_eq!(
+        res.exit_code, 0,
+        "stdout: {}\nstderr: {}",
+        res.stdout, res.stderr
+    );
+    assert!(
+        res.stdout.contains("imported 2 commit"),
+        "stdout: {}",
+        res.stdout
+    );
+    assert_eq!(commit_count(mono) - before, 2);
+    let subjects = mono.subjects("HEAD");
+    assert_eq!(subjects[subjects.len() - 2..], ["after: one", "after: two"]);
+    assert_eq!(
+        mono.tree_sha("HEAD", Some("core")),
+        s.pub_repo.tree_sha(&tip, None)
+    );
+    let messages = mono.messages("HEAD");
+    assert!(
+        messages
+            .last()
+            .is_some_and(|m| m.contains(&format!("Monosplice-Origin: {tip}"))),
+        "messages: {messages:?}"
+    );
+}
+
+/// Upstream's first-parent line bypasses a commit the monorepo already imported: `main` gets
+/// `a1` (pulled), a side branch from `a1^` gets `f1`, merges `main` in (first parent `f1`),
+/// and `main` is fast-forwarded to that merge. Returns `(a1, merge)`; `a1` is already pulled.
+fn push_bypassing_merge(
+    s: &Seeded,
+    a1_files: &[(&str, Option<&str>)],
+    f1_files: &[(&str, Option<&str>)],
+    resolution: &[(&str, Option<&str>)],
+) -> (String, String) {
+    let ext = &s.ext;
+    let init = ext.head();
+    let a1 = ext_commit(ext, "fixB", a1_files);
+    ext.git(&["push", "origin", "main"]);
+    let res = run_monosplice(&s.fixture.mono.dir, &["pull"]);
+    assert_eq!(res.exit_code, 0, "stderr: {}", res.stderr);
+
+    ext.git(&["checkout", "-b", "feat", &init]);
+    ext_commit(ext, "featA", f1_files);
+    let merge = ext.merge("main", "Merge branch 'main' into feat", resolution);
+    ext.git(&["checkout", "main"]);
+    ext.git(&["merge", "--ff-only", "feat"]);
+    ext.git(&["push", "origin", "main"]);
+    (a1, merge)
+}
+
+fn assert_single_import_of(s: &Seeded, merge: &str) {
+    let mono = &s.fixture.mono;
+    let status = run_monosplice(&mono.dir, &["status"]);
+    assert_eq!(status.exit_code, 0, "stderr: {}", status.stderr);
+    assert!(
+        status.stdout.contains("core: 1 to pull"),
+        "stdout: {}",
+        status.stdout
+    );
+
+    let before = commit_count(mono);
+    let res = run_monosplice(&mono.dir, &["pull"]);
+    assert_eq!(
+        res.exit_code, 0,
+        "stdout: {}\nstderr: {}",
+        res.stdout, res.stderr
+    );
+    assert!(!mono.exists(SEQUENCER));
+    assert_eq!(commit_count(mono) - before, 1, "only the merge is imported");
+    let messages = mono.messages("HEAD");
+    assert!(
+        messages
+            .last()
+            .is_some_and(|m| m.contains(&format!("Monosplice-Origin: {merge}"))),
+        "messages: {messages:?}"
+    );
+
+    let status = run_monosplice(&mono.dir, &["status"]);
+    assert!(
+        status.stdout.contains("core: in sync") || status.stdout.contains("to push"),
+        "stdout: {}",
+        status.stdout
+    );
+    assert!(
+        !status.stdout.contains("to pull"),
+        "stdout: {}",
+        status.stdout
+    );
+    let head = mono.head();
+    let again = run_monosplice(&mono.dir, &["pull"]);
+    assert_eq!(again.exit_code, 0, "stderr: {}", again.stderr);
+    assert!(
+        again.stdout.contains("up to date"),
+        "stdout: {}",
+        again.stdout
+    );
+    assert_eq!(mono.head(), head);
+}
+
+/// S169: the first-parent line from the new head skips a commit the monorepo already
+/// imported. Only the merge is replayed, diffed against that imported commit, so the side
+/// branch's edit never lands on content it did not see.
+#[test]
+fn s169_first_parent_line_bypassing_an_imported_commit_imports_only_the_merge() {
+    let s = seeded_at_changelog_init();
+    let mono = &s.fixture.mono;
+    let (_, merge) = push_bypassing_merge(
+        &s,
+        &[("CHANGELOG.md", Some(CL_FIX))],
+        &[("CHANGELOG.md", Some(CL_FEAT))],
+        &[("CHANGELOG.md", Some(CL_MERGED))],
+    );
+
+    assert_single_import_of(&s, &merge);
+    assert_eq!(
+        mono.tree_sha("HEAD", Some("core")),
+        s.pub_repo.tree_sha("HEAD", None)
+    );
+    let cl = mono.read("core/CHANGELOG.md");
+    assert_eq!(cl, CL_MERGED);
+    assert_eq!(cl.matches("- fix B").count(), 1);
+    assert_eq!(cl.matches("- feat A").count(), 1);
+}
+
+/// S169, disjoint files: the merge's diff against its own first parent would re-add the
+/// already-imported file; diffed against the imported commit it adds only the side branch's.
+#[test]
+fn s169_bypassing_merge_of_disjoint_files_applies_each_change_once() {
+    let s = seeded_at_changelog_init();
+    let mono = &s.fixture.mono;
+    let (_, merge) = push_bypassing_merge(
+        &s,
+        &[("fix.txt", Some("x\n"))],
+        &[("feat.txt", Some("f\n"))],
+        &[],
+    );
+
+    assert_single_import_of(&s, &merge);
+    assert_eq!(
+        mono.tree_sha("HEAD", Some("core")),
+        s.pub_repo.tree_sha("HEAD", None)
+    );
+    assert_eq!(mono.read("core/fix.txt"), "x\n");
+    assert_eq!(mono.read("core/feat.txt"), "f\n");
+    assert_eq!(mono.read("core/CHANGELOG.md"), CL_BASE);
+}
+
+/// S170: the S169 shape with an unrelated committed local edit in `core/` → the pull still
+/// applies cleanly and keeps the local edit.
+#[test]
+fn s170_bypassing_merge_imports_beside_an_unrelated_local_edit() {
+    let s = seeded_at_changelog_init();
+    let mono = &s.fixture.mono;
+    let ext = &s.ext;
+    let init = ext.head();
+    ext_commit(ext, "fixB", &[("CHANGELOG.md", Some(CL_FIX))]);
+    ext.git(&["push", "origin", "main"]);
+    let res = run_monosplice(&mono.dir, &["pull"]);
+    assert_eq!(res.exit_code, 0, "stderr: {}", res.stderr);
+
+    mono.commit(
+        "feat(core): local edit",
+        &[(
+            "core/src/index.ts",
+            Some("export const hello = () => \"hi\"\n"),
+        )],
+    );
+
+    ext.git(&["checkout", "-b", "feat", &init]);
+    ext_commit(ext, "featA", &[("CHANGELOG.md", Some(CL_FEAT))]);
+    let merge = ext.merge(
+        "main",
+        "Merge branch 'main' into feat",
+        &[("CHANGELOG.md", Some(CL_MERGED))],
+    );
+    ext.git(&["checkout", "main"]);
+    ext.git(&["merge", "--ff-only", "feat"]);
+    ext.git(&["push", "origin", "main"]);
+
+    let res = run_monosplice(&mono.dir, &["pull"]);
+    assert_eq!(
+        res.exit_code, 0,
+        "stdout: {}\nstderr: {}",
+        res.stdout, res.stderr
+    );
+    assert!(!mono.exists(SEQUENCER));
+    assert_eq!(mono.read("core/CHANGELOG.md"), CL_MERGED);
+    assert_eq!(
+        mono.read("core/src/index.ts"),
+        "export const hello = () => \"hi\"\n"
+    );
+    let messages = mono.messages("HEAD");
+    assert!(
+        messages
+            .last()
+            .is_some_and(|m| m.contains(&format!("Monosplice-Origin: {merge}"))),
+        "messages: {messages:?}"
+    );
+}
+
+/// S171: a side branch with no commits of its own syncs `main` in with `merge --no-ff` from
+/// `fixB^`, and `main` fast-forwards to it. Nothing on the first-parent line is dropped, but
+/// the merge's first parent predates the imported `fixB`; diffed against it, `fixB` would be
+/// re-applied on top of a local edit to the same line and conflict.
+#[test]
+fn s171_empty_side_branch_merge_is_diffed_against_the_last_import() {
+    let s = seeded_at_changelog_init();
+    let mono = &s.fixture.mono;
+    let ext = &s.ext;
+    let init = ext.head();
+    ext_commit(ext, "fixB", &[("CHANGELOG.md", Some(CL_FIX))]);
+    ext.git(&["push", "origin", "main"]);
+    let res = run_monosplice(&mono.dir, &["pull"]);
+    assert_eq!(res.exit_code, 0, "stderr: {}", res.stderr);
+
+    let local = "# CL\n## Unreleased\n- fix B (with local notes)\n";
+    mono.commit(
+        "docs(core): annotate fix",
+        &[("core/CHANGELOG.md", Some(local))],
+    );
+
+    ext.git(&["checkout", "-b", "feat", &init]);
+    let merge = ext.merge("main", "Merge branch 'main' into feat", &[]);
+    ext.git(&["checkout", "main"]);
+    ext.git(&["merge", "--ff-only", "feat"]);
+    ext.git(&["push", "origin", "main"]);
+
+    let before = commit_count(mono);
+    let res = run_monosplice(&mono.dir, &["pull"]);
+    assert_eq!(
+        res.exit_code, 0,
+        "stdout: {}\nstderr: {}",
+        res.stdout, res.stderr
+    );
+    assert!(!mono.exists(SEQUENCER));
+    assert_eq!(commit_count(mono) - before, 1, "only the merge is imported");
+    let messages = mono.messages("HEAD");
+    assert!(
+        messages
+            .last()
+            .is_some_and(|m| m.contains(&format!("Monosplice-Origin: {merge}"))),
+        "messages: {messages:?}"
+    );
+    let cl = mono.read("core/CHANGELOG.md");
+    assert_eq!(cl, local);
+    assert_eq!(cl.matches("- fix B").count(), 1);
+}

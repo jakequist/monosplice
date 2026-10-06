@@ -276,6 +276,34 @@ impl TestRepo {
         self.head()
     }
 
+    /// Merge `branch` into the current branch as a true merge commit (`--no-ff`). A conflict
+    /// is fine: `files` is the hand resolution, written (`None` = delete) on top of whatever
+    /// the merge left before committing. Returns the merge commit sha.
+    pub fn merge(&self, branch: &str, message: &str, files: &[(&str, Option<&str>)]) -> String {
+        let date = next_date();
+        let env = [
+            ("GIT_AUTHOR_DATE", date.as_str()),
+            ("GIT_COMMITTER_DATE", date.as_str()),
+        ];
+        // Exit status is ignored on purpose: a conflicted merge exits 1 and leaves MERGE_HEAD,
+        // which the commit below completes.
+        let _ = spawn_git(
+            &self.dir,
+            &["merge", "--no-ff", "--no-commit", branch],
+            &env,
+            None,
+        );
+        for (rel, content) in files {
+            match content {
+                None => self.rm(rel),
+                Some(text) => self.write(rel, text),
+            }
+        }
+        self.git(&["add", "-A"]);
+        self.git_with(&["commit", "--no-edit", "-m", message], &env, None);
+        self.head()
+    }
+
     pub fn head(&self) -> String {
         self.git(&["rev-parse", "HEAD"])
     }
