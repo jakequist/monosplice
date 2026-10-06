@@ -97,7 +97,7 @@ pub fn run_rewrite_message(
         detail,
     };
 
-    let message_file = MessageFile::new(message).map_err(&fail)?;
+    let message_file = MessageFile::new(message).map_err(fail)?;
 
     let mut child = Command::new("sh")
         .arg("-c")
