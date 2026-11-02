@@ -446,3 +446,63 @@ fn an_old_branch_of_a_legacy_monorepo_does_not_reimport_its_own_export() {
     let pull = run_ok(&a.dir, &["pull"]);
     assert!(pull.stdout.contains("core: up to date"), "{}", pull.stdout);
 }
+
+/// Review finding 1: a shallow clone of B cannot see whether A's untagged trailers are its own.
+/// Guessing "ours" skips A's commits — the original bug — and after `fetch --unshallow` a push
+/// would publish a tree without them. With an `id` set, a shallow clone refuses instead.
+#[test]
+fn a_shallow_clone_of_a_monorepo_with_an_id_refuses_instead_of_guessing() {
+    let fx = shared_fixture();
+    let b = fx.monorepo("mono-b", Some("b"), false);
+    run_ok(&b.dir, &["attach", "core", &fx.pub_dir, "--import-history"]);
+    let b_remote = fx.sandbox.path().join("b-remote.git");
+    b.git(&[
+        "clone",
+        "-q",
+        "--bare",
+        ".",
+        &b_remote.display().to_string(),
+    ]);
+    let shallow = fx.sandbox.path().join("bs");
+    b.git(&[
+        "clone",
+        "-q",
+        "--depth",
+        "1",
+        &format!("file://{}", b_remote.display()),
+        &shallow.display().to_string(),
+    ]);
+    let shallow = TestRepo::new(shallow);
+
+    fx.a.commit("a two", &[("core/two.txt", Some("2\n"))]);
+    run_ok(&fx.a.dir, &["push"]);
+    let contrib = clone_remote(fx.sandbox.path(), &fx.pub_dir, "contrib");
+    contrib.commit("outside c3", &[("c3.txt", Some("3\n"))]);
+    contrib.git(&["push", "-q", "origin", "main"]);
+    let pub_head = fx.pub_repo.head();
+
+    for args in [&["pull"][..], &["status"][..], &["push", "--dry-run"][..]] {
+        let res = run_monosplice(&shallow.dir, args);
+        assert_ne!(res.exit_code, 0, "{args:?}: {}", res.stdout);
+        assert!(
+            res.stderr.contains("shallow clone") && res.stderr.contains("git fetch --unshallow"),
+            "{args:?}: {}",
+            res.stderr
+        );
+    }
+    let doc = run_monosplice(&shallow.dir, &["doctor"]);
+    assert_eq!(doc.exit_code, 1, "{}", doc.stdout);
+    assert!(
+        doc.stdout.contains("git fetch --unshallow"),
+        "{}",
+        doc.stdout
+    );
+    assert!(!shallow.exists("core/c3.txt"), "nothing was imported");
+
+    // Unshallowed, the history decides: A's trailers are A's, and both commits come in.
+    shallow.git(&["fetch", "-q", "--unshallow"]);
+    let pull = run_ok(&shallow.dir, &["pull"]);
+    assert!(pull.stdout.contains("imported 2 commit"), "{}", pull.stdout);
+    assert_eq!(shallow.read("core/two.txt"), "2\n");
+    assert_eq!(fx.pub_repo.head(), pub_head);
+}

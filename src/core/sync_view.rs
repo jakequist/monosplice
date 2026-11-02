@@ -55,6 +55,9 @@ pub enum SyncViewError {
         subrepo: String,
     },
     Git(GitError),
+    /// The trailers cannot be read safely from this clone; the message says why and what to do.
+    /// Every command refuses rather than act on a guess.
+    Unsafe(String),
 }
 
 impl std::fmt::Display for SyncViewError {
@@ -64,6 +67,7 @@ impl std::fmt::Display for SyncViewError {
                 write!(f, "{subrepo}: no fetch yet — run without --offline first")
             }
             SyncViewError::Git(e) => write!(f, "{e}"),
+            SyncViewError::Unsafe(message) => f.write_str(message),
         }
     }
 }
@@ -391,8 +395,9 @@ fn classify_sources(
     root: &Path,
     pub_walk: &[String],
     all_sources: &HashMap<String, Vec<String>>,
-    my_id: Option<&str>,
-) -> Result<ClassifiedSources, GitError> {
+    s: &ResolvedSubrepo,
+) -> Result<ClassifiedSources, SyncViewError> {
+    let my_id = s.monorepo_id.as_deref();
     let parsed: HashMap<&String, Vec<SourceRef>> = all_sources
         .iter()
         .map(|(pub_sha, values)| (pub_sha, values.iter().map(|v| parse_source(v)).collect()))
@@ -407,7 +412,22 @@ fn classify_sources(
             }
         }
     }
-    let (legacy_mine, legacy_assumed_shallow) = legacy_group_is_mine(root, &legacy)?;
+    let (legacy_mine, legacy_assumed_shallow) = match legacy_group_is_mine(root, &legacy)? {
+        Legacy::Mine => (true, false),
+        Legacy::Foreign => (false, false),
+        // A monorepo with no id is the only kind that ever published untagged trailers, so it
+        // keeps 1.0's reading. One with an id may be any monorepo, and guessing "ours" would
+        // skip another monorepo's exports on pull and drop them on the next push.
+        Legacy::Undecidable if my_id.is_none() => (true, true),
+        Legacy::Undecidable => {
+            return Err(SyncViewError::Unsafe(format!(
+                "{}: this is a shallow clone, and none of the {} monorepo commit(s) named by untagged {SOURCE_TRAILER} trailers on {} is in it, so monosplice cannot tell whether they are this monorepo's exports or another monorepo's.\nNothing was changed. Run `git fetch --unshallow`, then run the command again.",
+                s.name,
+                legacy.len(),
+                pull_source(s),
+            )))
+        }
+    };
 
     let mut out = ClassifiedSources {
         mine: HashMap::new(),
@@ -433,19 +453,27 @@ fn classify_sources(
     Ok(out)
 }
 
-/// Are the untagged trailers (newest first) this monorepo's? Returns `(mine, assumed)`, where
-/// `assumed` means only the shallow-clone rule made them ours.
-fn legacy_group_is_mine(root: &Path, legacy: &[String]) -> Result<(bool, bool), GitError> {
+/// Whose the untagged trailers are, as far as this clone can tell.
+enum Legacy {
+    Mine,
+    Foreign,
+    /// A shallow clone holding none of their commits: the history that would decide is missing.
+    Undecidable,
+}
+
+fn legacy_group_is_mine(root: &Path, legacy: &[String]) -> Result<Legacy, GitError> {
     if legacy.is_empty() || rev_parse(root, "HEAD").is_none() {
-        return Ok((false, false));
+        return Ok(Legacy::Foreign);
     }
     // Any commit they name that this clone has — an ancestor of HEAD, or on another branch —
     // makes them ours: another monorepo's commits are not in this object database at all.
     if !existing_commits(root, legacy)?.is_empty() {
-        return Ok((true, false));
+        return Ok(Legacy::Mine);
     }
-    let shallow = git(root, &["rev-parse", "--is-shallow-repository"])? == "true";
-    Ok((shallow, shallow))
+    if git(root, &["rev-parse", "--is-shallow-repository"])? == "true" {
+        return Ok(Legacy::Undecidable);
+    }
+    Ok(Legacy::Foreign)
 }
 
 /// Derive every sync cursor from trailers. There is no state file: this runs on each
@@ -500,7 +528,7 @@ pub fn load_sync_view(
     // none.
     let pub_walk = rev_list(root, &[&tracking_ref])?;
     let all_sources = trailer_values(root, SOURCE_TRAILER, &[&tracking_ref])?;
-    let sources = classify_sources(root, &pub_walk, &all_sources, s.monorepo_id.as_deref())?;
+    let sources = classify_sources(root, &pub_walk, &all_sources, s)?;
     let source_by_pub = sources.mine;
 
     let mut exported_mono_to_pub: HashMap<String, String> = HashMap::new();

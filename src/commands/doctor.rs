@@ -18,7 +18,8 @@ use crate::core::filter::filtered_subtree;
 use crate::core::git::{git, git_ok, rev_list};
 use crate::core::importer::{read_sequencer, sequencer_path};
 use crate::core::sync_view::{
-    is_triangular, load_sync_view, pull_source, try_load_fork_state, SyncView, SyncViewOptions,
+    is_triangular, load_sync_view, pull_source, try_load_fork_state, SyncView, SyncViewError,
+    SyncViewOptions,
 };
 use crate::core::trailers::{format_source, ORIGIN_TRAILER, SOURCE_TRAILER};
 use crate::report::{require_project, select_subrepos, Failure};
@@ -337,6 +338,14 @@ fn check_subrepo(
 
     let view = match load_sync_view(root, subrepo, &OPTS) {
         Ok(view) => view,
+        // Reachable, but the trailers cannot be read safely here: the message is the finding.
+        Err(SyncViewError::Unsafe(message)) => {
+            let mut lines = message.split('\n');
+            let headline = lines.next().unwrap_or("").to_string();
+            let detail: Vec<&str> = lines.collect();
+            problem(&mut section, headline, &detail);
+            return Ok((section, None));
+        }
         Err(err) => {
             section.row.reachable = false;
             // `trim_end` before splitting: git's stderr keeps its trailing newline, and the

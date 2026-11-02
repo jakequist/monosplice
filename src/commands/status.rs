@@ -193,6 +193,7 @@ fn inspect(
         Err(SyncViewError::Git(err)) => {
             return Err(Failure::error(unreachable_source(subrepo, &err).message))
         }
+        Err(SyncViewError::Unsafe(message)) => return Err(Failure::error(message)),
     };
     let Some(pub_head) = view.pub_head.clone() else {
         return Ok((unmeasured(), None));
