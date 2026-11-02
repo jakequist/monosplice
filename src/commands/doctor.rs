@@ -18,9 +18,10 @@ use crate::core::filter::filtered_subtree;
 use crate::core::git::{git, git_ok, rev_list};
 use crate::core::importer::{read_sequencer, sequencer_path};
 use crate::core::sync_view::{
-    is_triangular, load_sync_view, pull_source, try_load_fork_state, SyncView, SyncViewOptions,
+    is_triangular, load_sync_view, pull_source, try_load_fork_state, SyncView, SyncViewError,
+    SyncViewOptions,
 };
-use crate::core::trailers::{ORIGIN_TRAILER, SOURCE_TRAILER};
+use crate::core::trailers::{format_source, ORIGIN_TRAILER, SOURCE_TRAILER};
 use crate::report::{require_project, select_subrepos, Failure};
 
 #[derive(clap::Args, Debug)]
@@ -337,6 +338,14 @@ fn check_subrepo(
 
     let view = match load_sync_view(root, subrepo, &OPTS) {
         Ok(view) => view,
+        // Reachable, but the trailers cannot be read safely here: the message is the finding.
+        Err(SyncViewError::Unsafe(message)) => {
+            let mut lines = message.split('\n');
+            let headline = lines.next().unwrap_or("").to_string();
+            let detail: Vec<&str> = lines.collect();
+            problem(&mut section, headline, &detail);
+            return Ok((section, None));
+        }
         Err(err) => {
             section.row.reachable = false;
             // `trim_end` before splitting: git's stderr keeps its trailing newline, and the
@@ -412,17 +421,63 @@ fn check_subrepo(
     report_counts(&mut section, root, subrepo, &view)?;
 
     for broken in &view.broken_source_refs {
+        let collision = broken.id.as_deref().map(|id| {
+            format!("A duplicate id? Another monorepo with `id = \"{id}\"` publishing here would leave exactly this: give each monorepo its own id.")
+        });
+        let mut detail: Vec<&str> = Vec::new();
+        if let Some(collision) = &collision {
+            detail.push(collision);
+        }
+        detail.extend([
+            "Otherwise the monorepo clone is missing history (a shallow or partial clone), or the commit was",
+            "rewritten away before anything newer was exported. Run `git fetch --unshallow`, or restore the",
+            "commit; monosplice refuses to export until the mapping resolves, so nothing can be published on",
+            "top of a history it cannot see.",
+        ]);
         problem(
             &mut section,
             format!(
                 "standalone commit {} carries {SOURCE_TRAILER}: {}, but that monorepo commit does not exist in this clone.",
-                broken.pub_sha, broken.mono_sha
+                broken.pub_sha,
+                format_source(&broken.mono_sha, broken.id.as_deref())
+            ),
+            &detail,
+        );
+    }
+
+    if view.legacy_assumed_shallow {
+        note(
+            &mut section,
+            format!("shallow clone: untagged {SOURCE_TRAILER} trailers counted as this monorepo's."),
+            &[
+                "None of them names a commit this clone has in its history, but a shallow clone cannot tell its own",
+                "exports from another monorepo's. Run `git fetch --unshallow` to decide from history.",
+            ],
+        );
+    }
+
+    if view.legacy_off_head && subrepo.monorepo_id.is_some() {
+        note(
+            &mut section,
+            format!("untagged {SOURCE_TRAILER} trailers count as this monorepo's because a local branch holds a commit they name, though no ancestor of HEAD does."),
+            &[
+                "That is what a branch of this monorepo forked before its first export looks like. If the branch holds",
+                "another monorepo's history instead (fetched from it, say), delete it: while it exists, that monorepo's",
+                "untagged exports read as this one's, and pull skips them.",
+            ],
+        );
+    }
+
+    if view.foreign_sources > 0 {
+        note(
+            &mut section,
+            format!(
+                "informational: {} commit(s) published by another monorepo.",
+                view.foreign_sources
             ),
             &[
-                "Usually the monorepo clone is missing history (a shallow or partial clone), or `remote` points",
-                "at a repository that was published from a different monorepo.",
-                "Run `git fetch --unshallow` (or fix `remote` in your config); monosplice refuses to export until",
-                "the mapping resolves, so nothing can be published on top of a history it cannot see.",
+                "Their Monosplice-Source trailers name another monorepo's commits, so here they are ordinary",
+                "public commits: pulled like any outside contribution, never part of this monorepo's mapping.",
             ],
         );
     }

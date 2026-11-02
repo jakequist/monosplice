@@ -13,8 +13,8 @@ use std::path::Path;
 
 use crate::config::ResolvedSubrepo;
 use crate::core::exporter::{
-    check_export_preconditions, plan_export, publish_baseline, publish_full_history,
-    recover_export_anchor, run_export, ExportError,
+    check_export_preconditions, check_import_order, plan_export, publish_baseline,
+    publish_full_history, recover_export_anchor, run_export, ExportError,
 };
 use crate::core::filter::{has_committed_files, FilterError};
 use crate::core::git::{commit_subjects, rev_list, rev_parse, GitError};
@@ -335,6 +335,11 @@ pub fn export_subrepo(
     }
 
     let candidates = plan_export(root, subrepo, &view).map_err(raw_failure)?;
+    if let Some(problem) =
+        check_import_order(root, subrepo, &view, &candidates).map_err(raw_failure)?
+    {
+        return Err(SubrepoFailure::new(problem));
+    }
     let result = run_export(root, subrepo, &view, &candidates).map_err(|err| {
         // Everything up to the push is local, so in triangular mode a git failure here is the
         // fork's — never upstream's, which this code path does not write to at all.
@@ -489,6 +494,11 @@ pub fn plan_push_dry_run(
     }
 
     let candidates = plan_export(root, subrepo, &view).map_err(raw_failure)?;
+    if let Some(problem) =
+        check_import_order(root, subrepo, &view, &candidates).map_err(raw_failure)?
+    {
+        return Err(SubrepoFailure::new(problem));
+    }
     let shas: Vec<String> = candidates.into_iter().map(|c| c.mono_sha).collect();
     Ok(DryRunPlan::Export {
         commits: pending(root, &shas)?,
@@ -654,6 +664,7 @@ mod tests {
             rewrite_message: None,
             transform: None,
             scan: None,
+            monorepo_id: None,
         }
     }
 

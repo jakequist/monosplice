@@ -7,18 +7,20 @@
 
 use std::path::Path;
 
-use crate::config::ResolvedSubrepo;
+use crate::config::{ResolvedSubrepo, CONFIG_FILENAME};
 use crate::core::filter::{anchor_subtree, filtered_subtree, FilterError};
 use crate::core::git::{
-    commit_tree, git, git_ok, push_ref, push_ref_with_lease, read_commit, rev_list, CommitMeta,
-    CommitTreeInput, GitError, EMPTY_TREE,
+    commit_subjects, commit_tree, git, git_ok, push_ref, push_ref_with_lease, read_commit,
+    rev_list, CommitMeta, CommitTreeInput, GitError, EMPTY_TREE,
 };
 use crate::core::hooks::{run_rewrite_message, HookError};
 use crate::core::sync_view::{
     fork_tracking_ref, load_fork_state, remote_tracking_ref, unpublished_view, SyncView,
     SyncViewOptions,
 };
-use crate::core::trailers::{append_trailer, get_trailer, ORIGIN_TRAILER, SOURCE_TRAILER};
+use crate::core::trailers::{
+    append_trailer, format_source, get_trailer, remove_trailer, ORIGIN_TRAILER, SOURCE_TRAILER,
+};
 
 #[derive(Debug, Clone)]
 pub struct ExportCandidate {
@@ -179,7 +181,14 @@ pub fn compute_exports(
         if let Some(cmd) = &subrepo.rewrite_message {
             message = run_rewrite_message(cmd, root, &subrepo.name, &meta.sha, &meta.message)?;
         }
-        message = append_trailer(&message, SOURCE_TRAILER, &meta.sha);
+        // Exactly one Source trailer, ours: an imported commit still carries the one the
+        // other monorepo wrote, and two would claim the public commit for both.
+        message = remove_trailer(&message, SOURCE_TRAILER);
+        message = append_trailer(
+            &message,
+            SOURCE_TRAILER,
+            &format_source(&meta.sha, subrepo.monorepo_id.as_deref()),
+        );
 
         planned.push(PlannedExport {
             mono_sha: meta.sha.clone(),
@@ -462,9 +471,25 @@ pub fn check_export_preconditions(
     view: &SyncView,
 ) -> Option<String> {
     if let Some(broken) = view.broken_source_refs.first() {
+        let collision = match &broken.id {
+            Some(id) => format!("If another monorepo also has `id = \"{id}\"`, the ids collide: give each monorepo its own id.\n"),
+            None => String::new(),
+        };
         return Some(format!(
-            "{}: standalone commit {} carries {SOURCE_TRAILER}: {}, but that monorepo commit does not exist in this clone.\nThe commit mapping is broken, so monosplice cannot tell what is already published and will not export on top of it. Nothing was pushed to {}.\nRun `monosplice doctor` to see the full picture.",
-            subrepo.name, broken.pub_sha, broken.mono_sha, subrepo.remote,
+            "{}: standalone commit {} carries {SOURCE_TRAILER}: {}, but that monorepo commit does not exist in this clone.\nThe commit mapping is broken, so monosplice cannot tell what is already published and will not export on top of it. Nothing was pushed to {}.\n{collision}Run `monosplice doctor` to see the full picture.",
+            subrepo.name,
+            broken.pub_sha,
+            format_source(&broken.mono_sha, broken.id.as_deref()),
+            subrepo.remote,
+        ));
+    }
+
+    if subrepo.monorepo_id.is_none() && view.foreign_legacy_sources > 0 {
+        return Some(format!(
+            "{}: {} commit(s) on {} were published by another monorepo with untagged {SOURCE_TRAILER} trailers, and this monorepo has no `id` either, so its exports would be indistinguishable from theirs.\nNothing was pushed. Set `id = \"<name>\"` at the top of {CONFIG_FILENAME}, before the first [[subrepos]] — lowercase letters, digits and hyphens, unique to this monorepo — commit it, then push again.",
+            subrepo.name,
+            view.foreign_legacy_sources,
+            subrepo.remote,
         ));
     }
 
@@ -478,6 +503,114 @@ pub fn check_export_preconditions(
     }
 
     None
+}
+
+/// Does this import change the publishable subtree exactly as its public commit changed the
+/// public tree? Then it applied cleanly, and the work it carries is upstream's alone. A
+/// conflicted import that the user resolved differs — its resolution is new work, and it must
+/// export (CLAUDE.md).
+fn import_applied_cleanly(
+    root: &Path,
+    subrepo: &ResolvedSubrepo,
+    import: &str,
+    pub_sha: &str,
+) -> Result<bool, ExportError> {
+    let mono_before = anchor_subtree(root, &format!("{import}^"), subrepo)?
+        .unwrap_or_else(|| EMPTY_TREE.to_string());
+    let Some(mono_after) = anchor_subtree(root, import, subrepo)? else {
+        return Ok(false);
+    };
+    let pub_before = git(root, &["rev-parse", &format!("{pub_sha}^1^{{tree}}")])
+        .unwrap_or_else(|_| EMPTY_TREE.to_string());
+    let pub_after = git(root, &["rev-parse", &format!("{pub_sha}^{{tree}}")])?;
+    let diff = |a: &str, b: &str| git(root, &["diff-tree", "-r", "--no-renames", a, b]);
+    Ok(diff(&mono_before, &mono_after)? == diff(&pub_before, &pub_after)?)
+}
+
+/// Refuse when local commits under the subrepo sit below a clean import of another monorepo's
+/// export. Export replays in monorepo order, so it would publish the local commits first, on a
+/// tip that already has the import's changes but from trees that lack them — a temporary
+/// deletion — and then the import again on top. The other monorepo pulls that back as new work,
+/// lands it on its own local commits, and the two echo each other forever.
+///
+/// "Below a clean import" only: an import whose change differs from its public commit's is a
+/// resolved conflict, and that resolution must export as it always has.
+pub fn check_import_order(
+    root: &Path,
+    subrepo: &ResolvedSubrepo,
+    view: &SyncView,
+    candidates: &[ExportCandidate],
+) -> Result<Option<String>, ExportError> {
+    if view.foreign_pub_shas.is_empty() {
+        return Ok(None);
+    }
+    let mut locals: Vec<&str> = Vec::new();
+    let mut stuck: Vec<&str> = Vec::new();
+    let mut imports: Vec<(&str, String)> = Vec::new();
+    for candidate in candidates {
+        let sha = candidate.mono_sha.as_str();
+        let meta = read_commit(root, sha)?;
+        let Some(origin) = get_trailer(&meta.message, ORIGIN_TRAILER) else {
+            locals.push(sha);
+            continue;
+        };
+        if !view.foreign_pub_shas.contains(&origin) {
+            continue;
+        }
+        let below: Vec<&str> = locals
+            .iter()
+            .copied()
+            .filter(|local| git_ok(root, &["merge-base", "--is-ancestor", local, sha]))
+            .collect();
+        if below.is_empty() || !import_applied_cleanly(root, subrepo, sha, &origin)? {
+            continue;
+        }
+        for local in below {
+            if !stuck.contains(&local) {
+                stuck.push(local);
+            }
+        }
+        imports.push((sha, origin));
+    }
+    if stuck.is_empty() {
+        return Ok(None);
+    }
+
+    let list = |shas: &[String]| -> Result<String, ExportError> {
+        let subjects = commit_subjects(root, shas)?;
+        Ok(shas
+            .iter()
+            .map(|sha| {
+                format!(
+                    "    {} {}",
+                    &sha[..10.min(sha.len())],
+                    subjects.get(sha).map(String::as_str).unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"))
+    };
+    let stuck: Vec<String> = stuck.into_iter().map(str::to_string).collect();
+    let import_shas: Vec<String> = imports.iter().map(|(sha, _)| sha.to_string()).collect();
+    let name = &subrepo.name;
+    let mut message = format!(
+        "{name}: {} local commit(s) under {}/ sit below an import of another monorepo's export:\n{}\nimported on top of them:\n{}\nA push would publish your commits first, from trees without the imported changes (deleting them on {} for a commit), then the import again — which the other monorepo pulls back as new work, so the two echo each other. Nothing was pushed.\n",
+        stuck.len(),
+        subrepo.path,
+        list(&stuck)?,
+        list(&import_shas)?,
+        subrepo.remote,
+    );
+    let branch = git(root, &["symbolic-ref", "--short", "-q", "HEAD"]).ok();
+    match (&view.export_base, branch) {
+        (Some(base), Some(branch)) if !branch.is_empty() => message.push_str(&format!(
+            "Put the imports first and your commits on top of them. From the monorepo root (this rewrites {branch} from {base} on; if {branch} is shared, see \"Imports go below your own work\" in monosplice's docs/reference.md instead):\n  # commit or stash your work first: reset --keep refuses rather than discard it\n  git branch monosplice-local\n  git reset --keep {base}\n  monosplice pull {name}\n  git rebase --onto HEAD {base} monosplice-local\n  git checkout -B {branch}\n  git branch -D monosplice-local\n  monosplice push {name}\nThe rebase drops the old imports as already applied; if it stops on a conflict, resolve it and run `git rebase --continue`. Next time, pull before you commit."
+        )),
+        _ => message.push_str(
+            "Put the imports first and your commits on top of them (rebase your commits onto a fresh `monosplice pull`), then push again. Next time, pull before you commit.",
+        ),
+    }
+    Ok(Some(message))
 }
 
 /// The first public commit: the subrepo's current tree as one parentless commit. Returns
@@ -506,7 +639,7 @@ pub fn publish_baseline(
             message: append_trailer(
                 &format!("Initial import of {}\n", subrepo.name),
                 SOURCE_TRAILER,
-                &meta.sha,
+                &format_source(&meta.sha, subrepo.monorepo_id.as_deref()),
             ),
             author_name: meta.committer_name.clone(),
             author_email: meta.committer_email.clone(),
@@ -624,6 +757,7 @@ mod tests {
                 rewrite_message: None,
                 transform: None,
                 scan: None,
+                monorepo_id: None,
             }
         }
 
@@ -889,14 +1023,19 @@ mod tests {
 
     // --- rewrite detection & preconditions ---
 
+    /// Only a trailer tagged with our own id can be broken (an untagged one nothing here
+    /// resolves is another monorepo's), so the refusal names the id and the likely cause.
     #[test]
     fn a_broken_source_ref_refuses_the_export_with_the_ts_wording() {
         let f = Fixture::new("broken-precondition");
-        let s = f.subrepo();
+        let s = ResolvedSubrepo {
+            monorepo_id: Some("b".to_string()),
+            ..f.subrepo()
+        };
         let tree = f.sh("git rev-parse HEAD:core");
         let bogus = "0".repeat(40);
         let pub_sha = f.sh(&format!(
-            "printf 'export\n\nMonosplice-Source: {bogus}\n' | git commit-tree {tree} "
+            "printf 'export\n\nMonosplice-Source: {bogus} b\n' | git commit-tree {tree} "
         ));
         f.sh(&format!(
             "git push -q {} {pub_sha}:refs/heads/main",
@@ -908,7 +1047,7 @@ mod tests {
         assert_eq!(
             message,
             format!(
-                "core: standalone commit {pub_sha} carries Monosplice-Source: {bogus}, but that monorepo commit does not exist in this clone.\nThe commit mapping is broken, so monosplice cannot tell what is already published and will not export on top of it. Nothing was pushed to {}.\nRun `monosplice doctor` to see the full picture.",
+                "core: standalone commit {pub_sha} carries Monosplice-Source: {bogus} b, but that monorepo commit does not exist in this clone.\nThe commit mapping is broken, so monosplice cannot tell what is already published and will not export on top of it. Nothing was pushed to {}.\nIf another monorepo also has `id = \"b\"`, the ids collide: give each monorepo its own id.\nRun `monosplice doctor` to see the full picture.",
                 f.remote_url()
             )
         );

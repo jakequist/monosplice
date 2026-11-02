@@ -1,10 +1,13 @@
 //! Trailer keys that record the cross-repo commit mapping.
 //!
-//! - Public commits exported from the monorepo carry `Monosplice-Source: <mono-sha>`.
+//! - Public commits exported from the monorepo carry `Monosplice-Source: <mono-sha> <id>`, or
+//!   the legacy `Monosplice-Source: <mono-sha>` when the monorepo has no `id`.
 //! - Monorepo commits imported from a public repo carry `Monosplice-Origin: <pub-sha>`,
 //!   marking that pub commit as reflected in the monorepo.
 //!
-//! Import skips pub commits carrying Monosplice-Source (our own exports). Export
+//! Import skips pub commits carrying *our* Monosplice-Source (our own exports); which
+//! trailers are ours is decided in `sync_view`, since several monorepos may publish to one
+//! public repo. Export
 //! relies on tree equality, not trailers: pure imports are no-ops against the pub
 //! tip and get dropped, while conflicted imports (merges of mono + pub edits)
 //! export their resolution. Together these prevent ping-pong without ever losing
@@ -118,6 +121,65 @@ pub fn append_trailer(message: &str, key: &str, value: &str) -> String {
     format!("{body}\n\n{key}: {value}\n")
 }
 
+/// A `Monosplice-Source` value: the monorepo commit, and the id of the monorepo that
+/// published it. Legacy exports, and monorepos with no `id`, carry the sha alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRef {
+    pub mono_sha: String,
+    pub id: Option<String>,
+}
+
+/// Read a `Monosplice-Source` value: `<sha>`, or `<sha> <id>`.
+pub fn parse_source(value: &str) -> SourceRef {
+    let mut words = value.split_whitespace();
+    SourceRef {
+        mono_sha: words.next().unwrap_or("").to_string(),
+        id: words.next().map(str::to_string),
+    }
+}
+
+/// The value an export writes: tagged with the monorepo's id when it has one.
+pub fn format_source(mono_sha: &str, id: Option<&str>) -> String {
+    match id {
+        Some(id) => format!("{mono_sha} {id}"),
+        None => mono_sha.to_string(),
+    }
+}
+
+fn is_key_line(line: &str, key: &str) -> bool {
+    is_trailer_line(line)
+        && line
+            .split(':')
+            .next()
+            .is_some_and(|k| k.eq_ignore_ascii_case(key))
+}
+
+/// Drop every `key:` line (key compared ASCII case-insensitively) from the message's trailer
+/// block — its final paragraph, and only when that whole paragraph is trailers, the same test
+/// [`get_trailer`] uses. Everything before it is left as it was; a message with nothing to
+/// remove comes back byte-identical.
+pub fn remove_trailer(message: &str, key: &str) -> String {
+    let normalized = message.replace("\r\n", "\n");
+    let body = trim_end_js(&normalized);
+    let Some(run_start) = body.rfind("\n\n") else {
+        return message.to_string();
+    };
+    let last = &body[run_start..].trim_start_matches('\n');
+    if !is_trailer_block(last) || !last.split('\n').any(|line| is_key_line(line, key)) {
+        return message.to_string();
+    }
+    let head = body[..run_start].trim_end_matches('\n');
+    let kept: Vec<&str> = last
+        .split('\n')
+        .filter(|line| !is_key_line(line, key))
+        .collect();
+    let gap = &body[head.len()..body.len() - last.len()];
+    if kept.is_empty() {
+        return format!("{head}\n");
+    }
+    format!("{head}{gap}{}\n", kept.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +291,82 @@ mod tests {
     fn paragraphs_split_on_runs_of_two_or_more_newlines() {
         let msg = "subj\n\n\n\nMonosplice-Source: aaa";
         assert_eq!(get_trailer(msg, SOURCE_TRAILER).as_deref(), Some("aaa"));
+    }
+
+    #[test]
+    fn a_source_value_tagged_with_an_id_parses_into_sha_and_id() {
+        assert_eq!(
+            parse_source("abc123 pearly"),
+            SourceRef {
+                mono_sha: "abc123".to_string(),
+                id: Some("pearly".to_string()),
+            }
+        );
+        assert_eq!(format_source("abc123", Some("pearly")), "abc123 pearly");
+        let round = append_trailer("x", SOURCE_TRAILER, &format_source("abc", Some("b")));
+        let value = get_trailer(&round, SOURCE_TRAILER).expect("trailer");
+        assert_eq!(parse_source(&value).id.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_legacy_source_value_has_no_id() {
+        assert_eq!(
+            parse_source("abc123"),
+            SourceRef {
+                mono_sha: "abc123".to_string(),
+                id: None,
+            }
+        );
+        assert_eq!(format_source("abc123", None), "abc123");
+        // Stray whitespace is not an id.
+        assert_eq!(parse_source("  abc123  ").id, None);
+        assert_eq!(parse_source("  abc123  ").mono_sha, "abc123");
+    }
+
+    #[test]
+    fn removing_source_lines_keeps_every_other_trailer() {
+        let msg = "feat: x\n\nBody.\n\nSigned-off-by: S <s@x.y>\nMonosplice-Source: aaa\nMonosplice-Origin: bbb\nMonosplice-Source: ccc other\n";
+        assert_eq!(
+            remove_trailer(msg, SOURCE_TRAILER),
+            "feat: x\n\nBody.\n\nSigned-off-by: S <s@x.y>\nMonosplice-Origin: bbb\n"
+        );
+    }
+
+    #[test]
+    fn removing_the_only_trailer_drops_the_empty_block() {
+        assert_eq!(
+            remove_trailer("feat: x\n\nMonosplice-Source: aaa\n", SOURCE_TRAILER),
+            "feat: x\n"
+        );
+    }
+
+    #[test]
+    fn a_message_without_the_trailer_is_left_byte_identical() {
+        let msg = "feat: x\n\n\n\nodd spacing kept\n";
+        assert_eq!(remove_trailer(msg, SOURCE_TRAILER), msg);
+    }
+
+    #[test]
+    fn a_source_line_in_a_body_paragraph_is_kept_byte_identical() {
+        let msg = "feat: x\n\n\n\nMonosplice-Source: quoted in prose\nmore prose\n\nSigned-off-by: S <s@x.y>\nMonosplice-Source: aaa\n";
+        assert_eq!(
+            remove_trailer(msg, SOURCE_TRAILER),
+            "feat: x\n\n\n\nMonosplice-Source: quoted in prose\nmore prose\n\nSigned-off-by: S <s@x.y>\n"
+        );
+        // A final paragraph that is not a trailer block is not touched at all.
+        let prose = "feat: x\n\nMonosplice-Source: aaa\nnot a trailer\n";
+        assert_eq!(remove_trailer(prose, SOURCE_TRAILER), prose);
+    }
+
+    #[test]
+    fn a_source_trailer_key_is_matched_case_insensitively() {
+        assert_eq!(
+            remove_trailer(
+                "feat: x\n\nmonosplice-source: aaa\nMONOSPLICE-SOURCE: bbb b\nOther: c\n",
+                SOURCE_TRAILER
+            ),
+            "feat: x\n\nOther: c\n"
+        );
     }
 
     #[test]

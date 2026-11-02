@@ -66,10 +66,10 @@ fn version_prints_the_crate_version() {
     let sb = sandbox();
     let res = run_monosplice(sb.path(), &["-V"]);
     assert_eq!(res.exit_code, 0, "stderr: {}", res.stderr);
-    assert_eq!(res.stdout.trim(), "monosplice 1.0.1");
+    assert_eq!(res.stdout.trim(), "monosplice 1.1.0");
 
     let long = run_monosplice(sb.path(), &["--version"]);
-    assert_eq!(long.stdout.trim(), "monosplice 1.0.1");
+    assert_eq!(long.stdout.trim(), "monosplice 1.1.0");
 }
 
 #[test]

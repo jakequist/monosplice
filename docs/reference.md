@@ -271,6 +271,116 @@ Error: Invalid config at /repo/monosplice.toml:
 A config with no `[[subrepos]]` at all is valid — it means "nothing attached yet", which is
 exactly the state `init` leaves you in.
 
+One key sits outside the blocks: an optional `id` naming the monorepo itself. It must come
+before the first `[[subrepos]]` — TOML would otherwise file it under that subrepo, and the
+config is refused with a message saying where it belongs — and it is lowercase letters, digits
+and hyphens. You need it only when [several monorepos publish to the same standalone
+repo](#several-monorepos-one-standalone-repo).
+
+```toml
+id = "pearly"
+
+[[subrepos]]
+path = "vendor/bolide"
+remote = "https://github.com/you/bolide.git"
+```
+
+## Several monorepos, one standalone repo
+
+A standalone repo can be spliced into more than one monorepo: one publishes it, another vendors
+it and sends patches back the same way. Each monorepo must tell its own exports from the
+others', and the `Monosplice-Source` trailer is how: with `id` set, every export is tagged
+`Monosplice-Source: <monorepo-sha> <id>`; without one it is the legacy
+`Monosplice-Source: <monorepo-sha>`, which is what every monorepo wrote before ids existed.
+
+Each run classifies the trailers on the standalone branch:
+
+| Trailer | Whose |
+| --- | --- |
+| tagged with this monorepo's `id` | ours |
+| tagged with another `id` | another monorepo's |
+| untagged (legacy) | judged as one group per subrepo: ours if any of them names a commit reachable from `HEAD` or a local branch, another monorepo's otherwise (a fetched remote or a stray object does not count; with an `id`, `doctor` notes when only a branch other than `HEAD`'s history makes them ours) |
+
+Only our own trailers decide what is already published, what counts as a broken mapping, and
+what `pull` skips. Another monorepo's exports are ordinary standalone commits here: `attach
+--import-history` and `pull` replay them like any outside contribution, keeping their trailer
+in the imported message, and they never on their own make `attach` think the two repositories
+are already connected. `doctor` counts them in one note: `N commit(s) published by another
+monorepo`.
+
+When an exported commit already carries a `Monosplice-Source` line — a conflicted import of
+another monorepo's export does — `push` removes every such line (after `rewrite-message`) and
+appends exactly one, its own.
+
+The rules that keep two publishers apart:
+
+- **The first publisher may keep going without an `id`.** Its untagged trailers name its own
+  history, so they stay its own. Setting `id` later is safe too: old untagged and new tagged
+  trailers are both recognised.
+- **Every other publisher needs an `id`.** A monorepo with no `id` refuses to `push` beside
+  another monorepo's untagged trailers, and says to set one: its own untagged exports would be
+  indistinguishable from theirs. Pulling is never refused.
+- **Ids must be unique.** A trailer tagged with your own id that names a commit you do not have
+  is a broken mapping, as before; `doctor` reports it with a `duplicate id?` hint, and `push`
+  refuses.
+- **Shallow clones need full history once there are two publishers.** Which of the other
+  monorepo's exports were imported, and whose untagged trailers are whose, is decided by
+  commits a shallow clone does not have. So whenever the standalone branch carries a
+  `Monosplice-Source` trailer that is not this monorepo's — tagged or untagged, and with an
+  `id` that includes untagged ones the clone cannot place — every command refuses and says to
+  run `git fetch --unshallow`. A shallow clone of a single publisher (no `id`, no foreign
+  trailers) behaves exactly as before ids existed, and `doctor` notes when it assumed the
+  untagged trailers are its own.
+- **A foreign export an older monosplice skipped stops everything.** Before 1.1, `pull` read
+  every Source trailer as its own, so it skipped another monorepo's exports and imported the
+  commits after them without their changes. When a foreign commit on the standalone branch's
+  first-parent line sits between two sync points with no import of its own, every command
+  refuses, names the commit, and prints the by-hand import that brings it in (a
+  `git diff | git apply --3way` and a commit carrying `Monosplice-Origin: <sha>`). That import
+  lands above the 1.0 imports and any local commits, so `push` then asks for the imports first
+  (below). Either way, if the 1.0 imports are not shared yet, the cleaner route is to reset to
+  the commit before them and `monosplice pull` again on 1.1: every import is then made
+  properly, and nothing republishes a temporary deletion. Exporting on top of the by-hand
+  import without that, as 1.0's export order would, publishes the other monorepo's file deleted
+  for a commit and then restored.
+- **Imports go below your own work.** With two publishers, pull before you commit. When local
+  commits under the subrepo sit below an import of another monorepo's export, `push` and
+  `push --dry-run` refuse: exporting them first would publish trees without the imported
+  change, then the import again, and the other monorepo would pull that back — the two would
+  echo each other indefinitely. The refusal lists the commits and prints a sequence that puts
+  the imports first: commit or stash your work, branch it, `git reset --keep` to the last
+  export anchor (`--keep` refuses rather than discard local changes), `monosplice pull`,
+  `git rebase --onto HEAD <anchor> <branch>` (the old imports drop out as already applied),
+  then push. If a step stops on a dirty tree, stash and carry on from that step: your commits
+  are on `monosplice-local`. A conflicted import you resolved is not refused: its change
+  differs from the public commit's, and the resolution is exported as always.
+
+  That sequence rewrites the branch from the anchor on. When the local commits are already on
+  a shared branch, leave it alone and go through a copy instead (`core`, `main` and the shas
+  are examples; the refusal prints the anchor as the reset target):
+
+  ```sh
+  git switch -c monosplice-fix <anchor>        # a copy at the anchor
+  monosplice pull core                         # the imports first
+  git cherry-pick <local commits under core/, oldest first>
+  monosplice push core                         # publishes them once, on top
+  git switch main
+  git merge --no-edit monosplice-fix           # the shared branch gets the result
+  git commit --allow-empty -m "Anchor core at the standalone tip" \
+    -m "Monosplice-Origin: $(git rev-parse refs/monosplice/core/remote)"
+  ```
+
+  The last commit tells `push` that the shared branch now reproduces the standalone tip, so it
+  stops offering the old local commits again. To avoid all of this, pull before committing
+  under the subrepo, or push before merging into a shared branch.
+
+**Rollout is a hard precondition.** Every clone and CI runner that pulls or pushes the shared
+standalone repo — in every monorepo — must run monosplice 1.1.0 or later *before* the second
+monorepo publishes anything. Then set `id` in the second monorepo, commit it, and only then
+push from it. An older monosplice in the first monorepo reads the second's tagged trailers as
+its own: `push` calls them a broken mapping, and `pull` silently skips them, which 1.1 then
+refuses to build on until they are imported by hand.
+
 ### Hooks
 
 Hooks are shell commands. All three run **per exported commit**, against the tree that commit
@@ -311,7 +421,8 @@ the object database is written.
 `rewrite-message` is the odd one out: it shapes the commit, not the tree, so it runs from the
 monorepo root with the original message on **stdin** and the rewritten message expected on
 **stdout**. It runs *before* the `Monosplice-Source` trailer is appended, so you cannot
-accidentally strip it.
+accidentally strip it; any `Monosplice-Source` line still in its output is removed before
+monosplice appends its own.
 
 Worked examples, one of each:
 

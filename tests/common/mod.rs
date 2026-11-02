@@ -592,3 +592,150 @@ pub fn multi_fixture() -> MultiFixture {
         lib_pub,
     }
 }
+
+/// Write `monosplice.toml` with an optional top-level `id` above the `[[subrepos]]` blocks.
+pub fn write_config_with_id(repo: &TestRepo, id: Option<&str>, entries: &[&str]) {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(id) = id {
+        parts.push(format!("id = {}", toml_str(id)));
+    }
+    parts.extend(entries.iter().map(|e| e.trim_end().to_string()));
+    repo.write("monosplice.toml", &format!("{}\n", parts.join("\n\n")));
+}
+
+/// Several monorepos splicing one public repo: monorepo A (legacy, no `id`) publishes `core/`
+/// first, and other monorepos join it later through [`SharedFixture::monorepo`].
+pub struct SharedFixture {
+    pub sandbox: Sandbox,
+    /// The first publisher: no `id`, so its trailers are the legacy `<sha>` form.
+    pub a: TestRepo,
+    pub pub_dir: String,
+    pub pub_repo: TestRepo,
+}
+
+impl SharedFixture {
+    /// The `[[subrepos]]` block every monorepo here uses for `core/`.
+    pub fn core_block(&self) -> String {
+        subrepo_block(&[
+            ("name", &toml_str("core")),
+            ("path", &toml_str("core")),
+            ("remote", &toml_str(&self.pub_dir)),
+        ])
+    }
+
+    /// Another monorepo with its own unrelated history and an optional `id`. With
+    /// `configured`, its committed config already names `core/` (so `attach core` takes the
+    /// configured path); without it, the config holds only the id.
+    pub fn monorepo(&self, name: &str, id: Option<&str>, configured: bool) -> TestRepo {
+        let repo = make_repo(self.sandbox.path(), name);
+        let block = self.core_block();
+        let entries: Vec<&str> = if configured { vec![&block] } else { vec![] };
+        write_config_with_id(&repo, id, &entries);
+        repo.commit(
+            &format!("chore: start {name}"),
+            &[(
+                "app/main.ts",
+                Some(&format!("export const name = \"{name}\"\n")),
+            )],
+        );
+        repo
+    }
+}
+
+/// A has published `core/` with a baseline and two exported commits, all legacy trailers.
+pub fn shared_fixture() -> SharedFixture {
+    let sandbox = sandbox();
+    let a = make_repo(sandbox.path(), "mono-a");
+    let pub_dir = make_bare_remote(sandbox.path(), "core-pub");
+    let fx = SharedFixture {
+        a,
+        pub_repo: TestRepo::new(&pub_dir),
+        pub_dir,
+        sandbox,
+    };
+    write_config(&fx.a, &[&fx.core_block()]);
+    fx.a.commit(
+        "chore: initial monorepo a",
+        &[
+            ("core/README.md", Some("# core\n")),
+            ("core/src/index.ts", Some("export const hello = 1\n")),
+            ("private/notes.md", Some("a only\n")),
+        ],
+    );
+    run_ok(&fx.a.dir, &["push", "core", "--yes"]);
+    fx.a.commit(
+        "feat: one from a",
+        &[("core/src/one.ts", Some("export const one = 1\n"))],
+    );
+    fx.a.commit(
+        "feat: two from a",
+        &[("core/src/two.ts", Some("export const two = 2\n"))],
+    );
+    run_ok(&fx.a.dir, &["push"]);
+    fx
+}
+
+/// Run monosplice and panic with its output unless it exits 0.
+pub fn run_ok(dir: &Path, args: &[&str]) -> RunResult {
+    let res = run_monosplice(dir, args);
+    assert_eq!(
+        res.exit_code,
+        0,
+        "`monosplice {}` failed\nstdout:\n{}\nstderr:\n{}",
+        args.join(" "),
+        res.stdout,
+        res.stderr
+    );
+    res
+}
+
+/// Run, in order, every command a monosplice message advises: each line indented by two spaces
+/// that starts with `git ` or `monosplice `, through `sh -c` in `repo` with the test git env.
+/// Panics when one fails. Returns the commands it ran.
+pub fn run_advice(repo: &TestRepo, message: &str) -> Vec<String> {
+    let (ran, failed) = try_run_advice(repo, message);
+    if let Some((cmd, output)) = failed {
+        panic!("advised command failed: {cmd}\n{output}");
+    }
+    ran
+}
+
+/// [`run_advice`], stopping at the first command that fails instead of panicking. Returns the
+/// commands that succeeded, and the failing one with its output.
+pub fn try_run_advice(repo: &TestRepo, message: &str) -> (Vec<String>, Option<(String, String)>) {
+    let bin = env!("CARGO_BIN_EXE_monosplice");
+    let mut ran = Vec::new();
+    for line in message.lines() {
+        let Some(cmd) = line.strip_prefix("  ") else {
+            continue;
+        };
+        let cmd = if let Some(rest) = cmd.strip_prefix("monosplice ") {
+            format!("{bin} {rest}")
+        } else if cmd.starts_with("git ") {
+            cmd.to_string()
+        } else {
+            continue;
+        };
+        let date = next_date();
+        let mut sh = Command::new("sh");
+        sh.arg("-c").arg(&cmd).current_dir(&repo.dir);
+        for (k, v) in git_env() {
+            sh.env(k, v);
+        }
+        sh.env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date);
+        let out = sh
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run `{cmd}`: {e}"));
+        if !out.status.success() {
+            let output = format!(
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return (ran, Some((cmd, output)));
+        }
+        ran.push(cmd);
+    }
+    (ran, None)
+}

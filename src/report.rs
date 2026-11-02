@@ -216,11 +216,13 @@ mod tests {
             rewrite_message: None,
             transform: None,
             scan: None,
+            monorepo_id: None,
         }
     }
 
     fn project(names: &[&str]) -> Project {
         Project {
+            id: None,
             root: PathBuf::from("/repo"),
             config_path: PathBuf::from("/repo/monosplice.toml"),
             subrepos: names.iter().map(|n| subrepo(n)).collect(),

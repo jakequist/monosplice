@@ -10,10 +10,36 @@ brain and submodule-free ergonomics."
   histories. Monosplice replays commits across the boundary and records the correspondence.
   We never try to make the public repo a deterministic filter of monorepo history.
 - **Trailers are the source of truth for the commit mapping.**
-  - Exported public commits carry `Monosplice-Source: <monorepo-sha>`.
+  - Exported public commits carry `Monosplice-Source: <monorepo-sha> <id>`, where `id` is the
+    optional top-level config key naming the monorepo; with no `id`, the legacy
+    `Monosplice-Source: <monorepo-sha>`. Parsers accept both.
   - Imported monorepo commits carry `Monosplice-Origin: <public-sha>` — the marker that a pub
     commit is reflected in mono (so `pull` skips it and `push` stops refusing).
-  - Import skips pub commits with `Monosplice-Source` (our own exports).
+  - **Several monorepos may publish to one pub repo, so a Source trailer is ours only when it
+    says so.** Tagged with our id: ours. Tagged with another id: foreign. Untagged (legacy):
+    one group per subrepo, ours when any of them names a commit reachable from HEAD or a local
+    branch (`refs/heads/*`; a fetched remote or a stray object does not count), foreign
+    otherwise. Multi-publisher bookkeeping needs full history: a
+    shallow clone refuses every command (`git fetch --unshallow`) whenever pub carries a trailer
+    that is not ours, tagged or untagged (with an `id`, untagged ones it cannot decide count as
+    not ours). Without an `id` and with no foreign trailer, a shallow clone keeps 1.0's reading
+    of undecidable untagged trailers (ours), and `doctor` notes it. A foreign commit an older monosplice stepped over (no import of its
+    own, between two sync points on pub's first-parent line, and the import above them does not
+    reproduce its pub commit exactly; an export is a sync point only if its mono commit is
+    here) makes every command refuse until it is imported by hand. Only our trailers
+    feed the export map, `related`, the broken/superseded scans and the pull filter; foreign
+    ones are counted for `doctor` and never relate two repos on their own.
+  - Import skips pub commits with *our* `Monosplice-Source` (our own exports). Another
+    monorepo's exports are ordinary pub commits: imported like any contribution, keeping their
+    foreign trailer in the imported message.
+  - **Imports of foreign exports go below local work, never above it.** `push` refuses while
+    local subrepo commits sit below an import of a foreign export that applied cleanly (its
+    change equals its pub commit's): exporting them first would publish trees without the import
+    and then the import again, and two publishers would echo each other. An import whose change
+    differs is a resolved conflict and exports as before.
+  - Export removes every `Monosplice-Source` line from the outgoing message (after
+    `rewrite-message`) and appends exactly one, ours. With no `id`, export refuses beside
+    foreign *untagged* trailers: two untagged publishers cannot be told apart.
   - Export does NOT skip by trailer: a pure import's tree already equals the pub tip, so the
     tree-equality no-op check drops it; a *conflicted* import (merge of mono + pub edits)
     differs from the pub tip and MUST export, or the resolution would be lost. This is what

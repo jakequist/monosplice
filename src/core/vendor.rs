@@ -506,6 +506,7 @@ mod tests {
             rewrite_message: None,
             transform: None,
             scan: None,
+            monorepo_id: None,
         }
     }
 
@@ -541,6 +542,7 @@ mod tests {
         fs::write(&config_path, contents).unwrap();
         let subrepos = resolve_config(contents, &config_path).unwrap();
         Project {
+            id: None,
             root: dir.path().to_path_buf(),
             config_path,
             subrepos,
@@ -884,6 +886,7 @@ mod tests {
         let config_path = dir.path().join(CONFIG_FILENAME);
         fs::write(&config_path, original).unwrap();
         let project = Project {
+            id: None,
             root: dir.path().to_path_buf(),
             config_path: config_path.clone(),
             subrepos: resolve_config(original, &config_path).unwrap(),
