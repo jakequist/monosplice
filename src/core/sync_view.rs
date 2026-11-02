@@ -384,8 +384,8 @@ struct ClassifiedSources {
 /// Several monorepos may publish to one public repo, so a Source trailer is ours only when it
 /// says so. A tagged trailer (`<sha> <id>`) is ours exactly when the id is ours. Untagged ones
 /// predate ids and say nothing, so they are judged as one group per subrepo: ours when any of
-/// them names an ancestor of HEAD — the first publisher's history always contains its own
-/// exports, nobody else's does. A shallow clone cannot see that history, so there the group
+/// them names a commit this clone has — the first publisher's clones hold its own exports
+/// (on HEAD's history or another branch), nobody else's do. A shallow clone cannot see that history, so there the group
 /// stays ours, as it always was, and the view says the assumption was made.
 fn classify_sources(
     root: &Path,
@@ -439,10 +439,10 @@ fn legacy_group_is_mine(root: &Path, legacy: &[String]) -> Result<(bool, bool), 
     if legacy.is_empty() || rev_parse(root, "HEAD").is_none() {
         return Ok((false, false));
     }
-    for sha in existing_commits(root, legacy)? {
-        if git_ok(root, &["merge-base", "--is-ancestor", &sha, "HEAD"]) {
-            return Ok((true, false));
-        }
+    // Any commit they name that this clone has — an ancestor of HEAD, or on another branch —
+    // makes them ours: another monorepo's commits are not in this object database at all.
+    if !existing_commits(root, legacy)?.is_empty() {
+        return Ok((true, false));
     }
     let shallow = git(root, &["rev-parse", "--is-shallow-repository"])? == "true";
     Ok((shallow, shallow))

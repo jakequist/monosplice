@@ -420,3 +420,29 @@ fn a_fresh_clone_of_a_still_owns_the_untagged_trailers() {
         "still the legacy form: A has no id"
     );
 }
+
+/// Review finding 3: a branch of a legacy single monorepo, forked after attach but before the
+/// first export. Its own export is not an ancestor of that branch's HEAD, but the commit is right
+/// here in the object database — another branch of this monorepo, not another monorepo.
+#[test]
+fn an_old_branch_of_a_legacy_monorepo_does_not_reimport_its_own_export() {
+    let sb = common::sandbox();
+    let pub_dir = common::make_bare_remote(sb.path(), "core-pub");
+    let up = clone_remote(sb.path(), &pub_dir, "up");
+    up.commit("upstream root", &[("core0.txt", Some("0\n"))]);
+    up.git(&["push", "-q", "origin", "main"]);
+
+    let a = common::make_repo(sb.path(), "mono-a");
+    write_config_with_id(&a, None, &[]);
+    a.commit("a init", &[("app.txt", Some("a\n"))]);
+    run_ok(&a.dir, &["attach", "core", &pub_dir, "--import-history"]);
+    a.git(&["branch", "old"]);
+    a.commit("a mine", &[("core/mine.txt", Some("m\n"))]);
+    run_ok(&a.dir, &["push"]);
+
+    a.git(&["checkout", "-q", "old"]);
+    let st = run_ok(&a.dir, &["status"]);
+    assert!(st.stdout.contains("core: in sync"), "{}", st.stdout);
+    let pull = run_ok(&a.dir, &["pull"]);
+    assert!(pull.stdout.contains("core: up to date"), "{}", pull.stdout);
+}
