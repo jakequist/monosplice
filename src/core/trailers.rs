@@ -147,31 +147,37 @@ pub fn format_source(mono_sha: &str, id: Option<&str>) -> String {
 }
 
 fn is_key_line(line: &str, key: &str) -> bool {
-    is_trailer_line(line) && line.split(':').next() == Some(key)
+    is_trailer_line(line)
+        && line
+            .split(':')
+            .next()
+            .is_some_and(|k| k.eq_ignore_ascii_case(key))
 }
 
-/// Drop every `key:` trailer line from a message, and any paragraph that leaves empty. A
-/// message without one comes back byte-identical.
+/// Drop every `key:` line (key compared ASCII case-insensitively) from the message's trailer
+/// block — its final paragraph, and only when that whole paragraph is trailers, the same test
+/// [`get_trailer`] uses. Everything before it is left as it was; a message with nothing to
+/// remove comes back byte-identical.
 pub fn remove_trailer(message: &str, key: &str) -> String {
     let normalized = message.replace("\r\n", "\n");
-    if !normalized.split('\n').any(|line| is_key_line(line, key)) {
+    let body = trim_end_js(&normalized);
+    let Some(run_start) = body.rfind("\n\n") else {
+        return message.to_string();
+    };
+    let last = &body[run_start..].trim_start_matches('\n');
+    if !is_trailer_block(last) || !last.split('\n').any(|line| is_key_line(line, key)) {
         return message.to_string();
     }
-    let kept: Vec<String> = paragraphs(&normalized)
-        .iter()
-        .map(|block| {
-            block
-                .split('\n')
-                .filter(|line| !is_key_line(line, key))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .filter(|block| !block.is_empty())
+    let head = body[..run_start].trim_end_matches('\n');
+    let kept: Vec<&str> = last
+        .split('\n')
+        .filter(|line| !is_key_line(line, key))
         .collect();
+    let gap = &body[head.len()..body.len() - last.len()];
     if kept.is_empty() {
-        return String::new();
+        return format!("{head}\n");
     }
-    format!("{}\n", kept.join("\n\n"))
+    format!("{head}{gap}{}\n", kept.join("\n"))
 }
 
 #[cfg(test)]
@@ -338,6 +344,29 @@ mod tests {
     fn a_message_without_the_trailer_is_left_byte_identical() {
         let msg = "feat: x\n\n\n\nodd spacing kept\n";
         assert_eq!(remove_trailer(msg, SOURCE_TRAILER), msg);
+    }
+
+    #[test]
+    fn a_source_line_in_a_body_paragraph_is_kept_byte_identical() {
+        let msg = "feat: x\n\n\n\nMonosplice-Source: quoted in prose\nmore prose\n\nSigned-off-by: S <s@x.y>\nMonosplice-Source: aaa\n";
+        assert_eq!(
+            remove_trailer(msg, SOURCE_TRAILER),
+            "feat: x\n\n\n\nMonosplice-Source: quoted in prose\nmore prose\n\nSigned-off-by: S <s@x.y>\n"
+        );
+        // A final paragraph that is not a trailer block is not touched at all.
+        let prose = "feat: x\n\nMonosplice-Source: aaa\nnot a trailer\n";
+        assert_eq!(remove_trailer(prose, SOURCE_TRAILER), prose);
+    }
+
+    #[test]
+    fn a_source_trailer_key_is_matched_case_insensitively() {
+        assert_eq!(
+            remove_trailer(
+                "feat: x\n\nmonosplice-source: aaa\nMONOSPLICE-SOURCE: bbb b\nOther: c\n",
+                SOURCE_TRAILER
+            ),
+            "feat: x\n\nOther: c\n"
+        );
     }
 
     #[test]
