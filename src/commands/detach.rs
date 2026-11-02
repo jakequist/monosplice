@@ -117,11 +117,13 @@ mod tests {
             rewrite_message: None,
             transform: None,
             scan: None,
+            monorepo_id: None,
         }
     }
 
     fn project() -> Project {
         Project {
+            id: None,
             root: PathBuf::from("/repo"),
             config_path: PathBuf::from("/repo/monosplice.toml"),
             subrepos: vec![subrepo("core", "core"), subrepo("lib", "packages/lib")],

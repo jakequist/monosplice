@@ -118,6 +118,59 @@ pub fn append_trailer(message: &str, key: &str, value: &str) -> String {
     format!("{body}\n\n{key}: {value}\n")
 }
 
+/// A `Monosplice-Source` value: the monorepo commit, and the id of the monorepo that
+/// published it. Legacy exports, and monorepos with no `id`, carry the sha alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRef {
+    pub mono_sha: String,
+    pub id: Option<String>,
+}
+
+/// Read a `Monosplice-Source` value: `<sha>`, or `<sha> <id>`.
+pub fn parse_source(value: &str) -> SourceRef {
+    let mut words = value.split_whitespace();
+    SourceRef {
+        mono_sha: words.next().unwrap_or("").to_string(),
+        id: words.next().map(str::to_string),
+    }
+}
+
+/// The value an export writes: tagged with the monorepo's id when it has one.
+pub fn format_source(mono_sha: &str, id: Option<&str>) -> String {
+    match id {
+        Some(id) => format!("{mono_sha} {id}"),
+        None => mono_sha.to_string(),
+    }
+}
+
+fn is_key_line(line: &str, key: &str) -> bool {
+    is_trailer_line(line) && line.split(':').next() == Some(key)
+}
+
+/// Drop every `key:` trailer line from a message, and any paragraph that leaves empty. A
+/// message without one comes back byte-identical.
+pub fn remove_trailer(message: &str, key: &str) -> String {
+    let normalized = message.replace("\r\n", "\n");
+    if !normalized.split('\n').any(|line| is_key_line(line, key)) {
+        return message.to_string();
+    }
+    let kept: Vec<String> = paragraphs(&normalized)
+        .iter()
+        .map(|block| {
+            block
+                .split('\n')
+                .filter(|line| !is_key_line(line, key))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|block| !block.is_empty())
+        .collect();
+    if kept.is_empty() {
+        return String::new();
+    }
+    format!("{}\n", kept.join("\n\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +282,59 @@ mod tests {
     fn paragraphs_split_on_runs_of_two_or_more_newlines() {
         let msg = "subj\n\n\n\nMonosplice-Source: aaa";
         assert_eq!(get_trailer(msg, SOURCE_TRAILER).as_deref(), Some("aaa"));
+    }
+
+    #[test]
+    fn a_source_value_tagged_with_an_id_parses_into_sha_and_id() {
+        assert_eq!(
+            parse_source("abc123 pearly"),
+            SourceRef {
+                mono_sha: "abc123".to_string(),
+                id: Some("pearly".to_string()),
+            }
+        );
+        assert_eq!(format_source("abc123", Some("pearly")), "abc123 pearly");
+        let round = append_trailer("x", SOURCE_TRAILER, &format_source("abc", Some("b")));
+        let value = get_trailer(&round, SOURCE_TRAILER).expect("trailer");
+        assert_eq!(parse_source(&value).id.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_legacy_source_value_has_no_id() {
+        assert_eq!(
+            parse_source("abc123"),
+            SourceRef {
+                mono_sha: "abc123".to_string(),
+                id: None,
+            }
+        );
+        assert_eq!(format_source("abc123", None), "abc123");
+        // Stray whitespace is not an id.
+        assert_eq!(parse_source("  abc123  ").id, None);
+        assert_eq!(parse_source("  abc123  ").mono_sha, "abc123");
+    }
+
+    #[test]
+    fn removing_source_lines_keeps_every_other_trailer() {
+        let msg = "feat: x\n\nBody.\n\nSigned-off-by: S <s@x.y>\nMonosplice-Source: aaa\nMonosplice-Origin: bbb\nMonosplice-Source: ccc other\n";
+        assert_eq!(
+            remove_trailer(msg, SOURCE_TRAILER),
+            "feat: x\n\nBody.\n\nSigned-off-by: S <s@x.y>\nMonosplice-Origin: bbb\n"
+        );
+    }
+
+    #[test]
+    fn removing_the_only_trailer_drops_the_empty_block() {
+        assert_eq!(
+            remove_trailer("feat: x\n\nMonosplice-Source: aaa\n", SOURCE_TRAILER),
+            "feat: x\n"
+        );
+    }
+
+    #[test]
+    fn a_message_without_the_trailer_is_left_byte_identical() {
+        let msg = "feat: x\n\n\n\nodd spacing kept\n";
+        assert_eq!(remove_trailer(msg, SOURCE_TRAILER), msg);
     }
 
     #[test]

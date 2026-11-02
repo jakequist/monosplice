@@ -40,6 +40,9 @@ pub struct ResolvedSubrepo {
     pub rewrite_message: Option<String>,
     pub transform: Option<String>,
     pub scan: Option<String>,
+    /// The top-level `id` of the monorepo this subrepo belongs to, carried here so every
+    /// sync decision can tell this monorepo's exports from another's.
+    pub monorepo_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +50,8 @@ pub struct Project {
     /// Directory containing monosplice.toml (treated as the monorepo root).
     pub root: PathBuf,
     pub config_path: PathBuf,
+    /// Tags this monorepo's `Monosplice-Source` trailers; `None` writes the legacy form.
+    pub id: Option<String>,
     pub subrepos: Vec<ResolvedSubrepo>,
 }
 
@@ -87,6 +92,9 @@ struct RawSubrepo {
     rewrite_message: Option<String>,
     transform: Option<String>,
     scan: Option<String>,
+    /// Never valid here: accepted only so a misplaced top-level `id` gets a message that says
+    /// where it belongs instead of serde's "unknown field".
+    id: Option<String>,
 }
 
 /// `subrepos` defaults to empty rather than being required: `init` writes a template whose
@@ -95,6 +103,7 @@ struct RawSubrepo {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    id: Option<String>,
     #[serde(default)]
     subrepos: Vec<RawSubrepo>,
 }
@@ -192,6 +201,14 @@ pub fn check_config_placement(config_path: &Path, git_toplevel: &Path) -> Result
 
 /// Validate raw TOML text. Exported for unit tests and for the attach/detach reload check.
 pub fn resolve_config(raw: &str, config_path: &Path) -> Result<Vec<ResolvedSubrepo>, ConfigError> {
+    resolve_with_id(raw, config_path).map(|(_, subrepos)| subrepos)
+}
+
+/// [`resolve_config`], plus the monorepo's `id`.
+pub fn resolve_with_id(
+    raw: &str,
+    config_path: &Path,
+) -> Result<(Option<String>, Vec<ResolvedSubrepo>), ConfigError> {
     let parsed: RawConfig = match toml::from_str(raw) {
         Ok(parsed) => parsed,
         Err(err) => return Err(ConfigError::at(config_path, &indent(&err.to_string()))),
@@ -200,7 +217,19 @@ pub fn resolve_config(raw: &str, config_path: &Path) -> Result<Vec<ResolvedSubre
     // Empty strings are a config typo, not a value; serde cannot see them, so they are
     // collected here and reported together the way zod reported its issue list.
     let mut issues: Vec<String> = Vec::new();
+    if let Some(id) = &parsed.id {
+        if !is_valid_id(id) {
+            issues.push(format!(
+                "  id — lowercase letters, digits and hyphens only, and not empty (got {id:?})"
+            ));
+        }
+    }
     for (idx, s) in parsed.subrepos.iter().enumerate() {
+        if s.id.is_some() {
+            issues.push(format!(
+                "  subrepos[{idx}].id — `id` names the whole monorepo, so it goes at the top of the file, before the first [[subrepos]]"
+            ));
+        }
         let mut require = |field: &str, value: &str| {
             if value.is_empty() {
                 issues.push(format!(
@@ -270,6 +299,7 @@ pub fn resolve_config(raw: &str, config_path: &Path) -> Result<Vec<ResolvedSubre
             rewrite_message: s.rewrite_message,
             transform: s.transform,
             scan: s.scan,
+            monorepo_id: parsed.id.clone(),
         });
     }
 
@@ -301,7 +331,16 @@ pub fn resolve_config(raw: &str, config_path: &Path) -> Result<Vec<ResolvedSubre
         seen_names.push(&s.name);
         seen_paths.push(&s.path);
     }
-    Ok(resolved)
+    Ok((parsed.id, resolved))
+}
+
+/// An `id` ends up inside every exported commit message, so it is kept to a shape that needs
+/// no quoting anywhere: lowercase letters, digits and hyphens.
+fn is_valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// Last segment of a normalized (always `/`-separated, never empty) subrepo path.
@@ -323,8 +362,9 @@ pub fn load_project(start_dir: &Path) -> Result<Option<Project>, ConfigError> {
             ))
         }
     };
-    let subrepos = resolve_config(&raw, &config_path)?;
+    let (id, subrepos) = resolve_with_id(&raw, &config_path)?;
     Ok(Some(Project {
+        id,
         root: config_path
             .parent()
             .map(Path::to_path_buf)
@@ -619,6 +659,61 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    // --- the monorepo's id ---
+
+    #[test]
+    fn a_top_level_id_reaches_every_subrepo_and_the_project() {
+        let (id, subrepos) = resolve_with_id(
+            "id = \"pearly-2\"\n\n[[subrepos]]\npath = \"a\"\nremote = \"r\"\n\n[[subrepos]]\npath = \"b\"\nremote = \"s\"\n",
+            Path::new(CONFIG_PATH),
+        )
+        .unwrap();
+        assert_eq!(id.as_deref(), Some("pearly-2"));
+        assert!(subrepos
+            .iter()
+            .all(|s| s.monorepo_id.as_deref() == Some("pearly-2")));
+
+        let dir = TempDir::new("load-id");
+        fs::write(dir.path().join(CONFIG_FILENAME), "id = \"meteor\"\n").unwrap();
+        let project = load_project(dir.path()).unwrap().expect("a project");
+        assert_eq!(project.id.as_deref(), Some("meteor"));
+    }
+
+    #[test]
+    fn no_id_is_the_legacy_default() {
+        let s = resolve("[[subrepos]]\npath = \"core\"\nremote = \"r\"\n").unwrap();
+        assert_eq!(s[0].monorepo_id, None);
+    }
+
+    #[test]
+    fn an_id_is_lowercase_letters_digits_and_hyphens() {
+        for bad in ["", "Pearly", "a_b", "a b", "a.b", "é"] {
+            let message = err(&format!("id = {}\n", toml_quote(bad)));
+            assert!(
+                message.starts_with(&format!("Invalid config at {CONFIG_PATH}:")),
+                "{message}"
+            );
+            assert!(
+                message.contains("id — lowercase letters, digits and hyphens"),
+                "{bad:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_id_after_the_first_subrepo_block_is_refused_by_name() {
+        let message = err("[[subrepos]]\npath = \"core\"\nremote = \"r\"\nid = \"pearly\"\n");
+        assert!(message.contains("subrepos[0].id"), "{message}");
+        assert!(
+            message.contains("before the first [[subrepos]]"),
+            "{message}"
+        );
+    }
+
+    fn toml_quote(s: &str) -> String {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
     }
 
     // --- triangular config validation (port of test/unit/triangular.test.ts) ---
