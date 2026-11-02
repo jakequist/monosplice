@@ -153,6 +153,9 @@ pub struct SyncView {
     /// No untagged trailer is an ancestor of HEAD, but this is a shallow clone, so they were
     /// counted as ours rather than another monorepo's: the history that would decide is missing.
     pub legacy_assumed_shallow: bool,
+    /// The untagged trailers are ours only because a local branch other than HEAD's history
+    /// holds a commit they name.
+    pub legacy_off_head: bool,
 }
 
 /// The view of a subrepo whose public branch does not exist yet.
@@ -173,6 +176,7 @@ pub fn unpublished_view(name: &str) -> SyncView {
         foreign_sources: 0,
         foreign_legacy_sources: 0,
         legacy_assumed_shallow: false,
+        legacy_off_head: false,
     }
 }
 
@@ -385,6 +389,7 @@ struct ClassifiedSources {
     /// The foreign public commits themselves.
     foreign_shas: HashSet<String>,
     legacy_assumed_shallow: bool,
+    legacy_off_head: bool,
 }
 
 /// Several monorepos may publish to one public repo, so a Source trailer is ours only when it
@@ -414,8 +419,12 @@ fn classify_sources(
             }
         }
     }
+    let mut legacy_off_head = false;
     let (legacy_mine, legacy_assumed_shallow) = match legacy_group_is_mine(root, &legacy)? {
-        Legacy::Mine => (true, false),
+        Legacy::Mine { on_head } => {
+            legacy_off_head = !on_head;
+            (true, false)
+        }
         Legacy::Foreign => (false, false),
         // A monorepo with no id is the only kind that ever published untagged trailers, so it
         // keeps 1.0's reading. One with an id may be any monorepo, and guessing "ours" would
@@ -434,6 +443,7 @@ fn classify_sources(
     let mut out = ClassifiedSources {
         mine: HashMap::new(),
         foreign_shas: HashSet::new(),
+        legacy_off_head,
         foreign: 0,
         foreign_legacy: 0,
         legacy_assumed_shallow,
@@ -459,7 +469,10 @@ fn classify_sources(
 
 /// Whose the untagged trailers are, as far as this clone can tell.
 enum Legacy {
-    Mine,
+    /// `on_head`: one of their commits is an ancestor of HEAD, not only on another branch.
+    Mine {
+        on_head: bool,
+    },
     Foreign,
     /// A shallow clone holding none of their commits: the history that would decide is missing.
     Undecidable,
@@ -469,10 +482,31 @@ fn legacy_group_is_mine(root: &Path, legacy: &[String]) -> Result<Legacy, GitErr
     if legacy.is_empty() || rev_parse(root, "HEAD").is_none() {
         return Ok(Legacy::Foreign);
     }
-    // Any commit they name that this clone has — an ancestor of HEAD, or on another branch —
-    // makes them ours: another monorepo's commits are not in this object database at all.
-    if !existing_commits(root, legacy)?.is_empty() {
-        return Ok(Legacy::Mine);
+    // A commit they name on HEAD's history or a local branch makes them ours: another
+    // monorepo's commits are on no branch here. Merely present is not enough — a fetched remote
+    // or an unreachable object can hold another monorepo's history.
+    let present = existing_commits(root, legacy)?;
+    if present
+        .iter()
+        .any(|sha| git_ok(root, &["merge-base", "--is-ancestor", sha, "HEAD"]))
+    {
+        return Ok(Legacy::Mine { on_head: true });
+    }
+    for sha in &present {
+        let branches = git(
+            root,
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--format=%(refname)",
+                "--contains",
+                sha,
+                "refs/heads/",
+            ],
+        )?;
+        if !branches.is_empty() {
+            return Ok(Legacy::Mine { on_head: false });
+        }
     }
     if git(root, &["rev-parse", "--is-shallow-repository"])? == "true" {
         return Ok(Legacy::Undecidable);
@@ -715,6 +749,7 @@ pub fn load_sync_view(
         foreign_sources: sources.foreign,
         foreign_legacy_sources: sources.foreign_legacy,
         legacy_assumed_shallow: sources.legacy_assumed_shallow,
+        legacy_off_head: sources.legacy_off_head,
     })
 }
 

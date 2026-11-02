@@ -674,3 +674,35 @@ fn shallow_clones_of_a_do_not_report_b_s_exports_as_skipped() {
         assert!(!st.stderr.contains("never imported"), "{}", st.stderr);
     }
 }
+
+/// Round-2 review finding 3: B once fetched A's monorepo as a remote. A's exported commits are
+/// now objects in B, but on no branch of B's: they are still another monorepo's.
+#[test]
+fn a_fetched_remote_does_not_make_another_monorepo_s_trailers_ours() {
+    let fx = shared_fixture();
+    let b = fx.monorepo("mono-b", Some("b"), false);
+    run_ok(&b.dir, &["attach", "core", &fx.pub_dir, "--import-history"]);
+    fx.a.commit("a two", &[("core/two.txt", Some("2\n"))]);
+    run_ok(&fx.a.dir, &["push"]);
+    b.git(&[
+        "fetch",
+        "-q",
+        &fx.a.dir.display().to_string(),
+        "main:refs/remotes/a/main",
+    ]);
+
+    let pull = run_ok(&b.dir, &["pull"]);
+    assert!(pull.stdout.contains("imported 1 commit"), "{}", pull.stdout);
+    assert_eq!(b.read("core/two.txt"), "2\n");
+
+    // A local branch holding A's history does make them ours — and with an id, doctor says why.
+    b.git(&["branch", "from-a", "refs/remotes/a/main"]);
+    let doc = run_monosplice(&b.dir, &["doctor"]);
+    assert!(
+        doc.stdout
+            .contains("untagged Monosplice-Source trailers count as this monorepo's")
+            && doc.stdout.contains("no ancestor of HEAD"),
+        "{}",
+        doc.stdout
+    );
+}

@@ -456,6 +456,18 @@ fn check_subrepo(
         );
     }
 
+    if view.legacy_off_head && subrepo.monorepo_id.is_some() {
+        note(
+            &mut section,
+            format!("untagged {SOURCE_TRAILER} trailers count as this monorepo's because a local branch holds a commit they name, though no ancestor of HEAD does."),
+            &[
+                "That is what a branch of this monorepo forked before its first export looks like. If the branch holds",
+                "another monorepo's history instead (fetched from it, say), delete it: while it exists, that monorepo's",
+                "untagged exports read as this one's, and pull skips them.",
+            ],
+        );
+    }
+
     if view.foreign_sources > 0 {
         note(
             &mut section,
