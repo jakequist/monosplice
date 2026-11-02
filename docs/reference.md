@@ -348,11 +348,31 @@ The rules that keep two publishers apart:
   `push --dry-run` refuse: exporting them first would publish trees without the imported
   change, then the import again, and the other monorepo would pull that back — the two would
   echo each other indefinitely. The refusal lists the commits and prints a sequence that puts
-  the imports first: branch the work, `git reset --hard` to the last export anchor,
-  `monosplice pull`, `git rebase --onto HEAD <anchor> <branch>` (the old imports drop out as
-  already applied), then push. It rewrites the branch from the anchor on, so do it before the
-  branch is shared. A conflicted import you resolved is not refused: its change differs from
-  the public commit's, and the resolution is exported as always.
+  the imports first: commit or stash your work, branch it, `git reset --keep` to the last
+  export anchor (`--keep` refuses rather than discard local changes), `monosplice pull`,
+  `git rebase --onto HEAD <anchor> <branch>` (the old imports drop out as already applied),
+  then push. If a step stops on a dirty tree, stash and carry on from that step: your commits
+  are on `monosplice-local`. A conflicted import you resolved is not refused: its change
+  differs from the public commit's, and the resolution is exported as always.
+
+  That sequence rewrites the branch from the anchor on. When the local commits are already on
+  a shared branch, leave it alone and go through a copy instead (`core`, `main` and the shas
+  are examples; the refusal prints the anchor as the reset target):
+
+  ```sh
+  git switch -c monosplice-fix <anchor>        # a copy at the anchor
+  monosplice pull core                         # the imports first
+  git cherry-pick <local commits under core/, oldest first>
+  monosplice push core                         # publishes them once, on top
+  git switch main
+  git merge --no-edit monosplice-fix           # the shared branch gets the result
+  git commit --allow-empty -m "Anchor core at the standalone tip" \
+    -m "Monosplice-Origin: $(git rev-parse refs/monosplice/core/remote)"
+  ```
+
+  The last commit tells `push` that the shared branch now reproduces the standalone tip, so it
+  stops offering the old local commits again. To avoid all of this, pull before committing
+  under the subrepo, or push before merging into a shared branch.
 
 **Rollout is a hard precondition.** Every clone and CI runner that pulls or pushes the shared
 standalone repo — in every monorepo — must run monosplice 1.1.0 or later *before* the second
