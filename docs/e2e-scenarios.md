@@ -225,3 +225,6 @@ subrepo, `core/` = the configured subrepo path.
 - [x] S188 Two monorepos with the same id: the second's `doctor` reports the unresolvable trailer as a problem with a `duplicate id?` hint, and its `push` refuses; nothing is published.
 - [x] S189 A's untagged trailers stay A's: with one rebased away (superseded, not foreign), in a fresh clone, and in a shallow clone (counted as A's, as before; `doctor` notes the assumption).
 - [x] S190 A sets `id = "a"` later: old untagged and new tagged trailers are both A's, and `doctor` is clean; B pulls A's tagged export like any other.
+- [x] S191 A shallow clone of B (`id = "b"`) holding none of A's exported commits refuses `pull`, `status`, `push --dry-run` and `doctor`, naming `git fetch --unshallow`; unshallowed, `pull` imports A's commits.
+- [x] S192 A 1.0-style pull in A skipped B's tagged export and imported the next commit past it → `push`, `push --dry-run`, `status`, `pull` and `doctor` refuse, naming the skipped commit; importing it by hand with its Origin trailer clears the refusal and `push` publishes B's file intact.
+- [x] S193 A branch of legacy A forked after attach but before the first export → `status` in sync, `pull` up to date (its own export exists locally, so the untagged trailers stay A's).

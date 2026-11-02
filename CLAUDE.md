@@ -17,8 +17,12 @@ brain and submodule-free ergonomics."
     commit is reflected in mono (so `pull` skips it and `push` stops refusing).
   - **Several monorepos may publish to one pub repo, so a Source trailer is ours only when it
     says so.** Tagged with our id: ours. Tagged with another id: foreign. Untagged (legacy):
-    one group per subrepo, ours when any of them names an ancestor of HEAD, foreign otherwise
-    (in a shallow clone, which cannot tell, ours — and `doctor` notes it). Only our trailers
+    one group per subrepo, ours when any of them names a commit this clone has (an ancestor of
+    HEAD or another branch), foreign otherwise. A shallow clone holding none of them cannot
+    tell: with an `id` every command refuses (`git fetch --unshallow`); with none they stay ours
+    and `doctor` notes it. A foreign commit an older monosplice stepped over (no import of its
+    own, between two sync points on pub's first-parent line) makes every command refuse until
+    it is imported by hand. Only our trailers
     feed the export map, `related`, the broken/superseded scans and the pull filter; foreign
     ones are counted for `doctor` and never relate two repos on their own.
   - Import skips pub commits with *our* `Monosplice-Source` (our own exports). Another

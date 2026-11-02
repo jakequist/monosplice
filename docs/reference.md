@@ -299,7 +299,7 @@ Each run classifies the trailers on the standalone branch:
 | --- | --- |
 | tagged with this monorepo's `id` | ours |
 | tagged with another `id` | another monorepo's |
-| untagged (legacy) | judged as one group per subrepo: ours if any of them names an ancestor of `HEAD`, another monorepo's otherwise |
+| untagged (legacy) | judged as one group per subrepo: ours if any of them names a commit this clone has (on `HEAD`'s history or another branch), another monorepo's otherwise |
 
 Only our own trailers decide what is already published, what counts as a broken mapping, and
 what `pull` skips. Another monorepo's exports are ordinary standalone commits here: `attach
@@ -323,12 +323,24 @@ The rules that keep two publishers apart:
 - **Ids must be unique.** A trailer tagged with your own id that names a commit you do not have
   is a broken mapping, as before; `doctor` reports it with a `duplicate id?` hint, and `push`
   refuses.
-- **Shallow clones** cannot see whether an untagged trailer names their own history, so there
-  they are counted as ours, exactly as before ids existed, and `doctor` notes the assumption.
+- **Shallow clones** may not hold the commits that decide. With an `id`, a shallow clone that
+  has none of the commits the untagged trailers name refuses every command and says to run
+  `git fetch --unshallow`: guessing "ours" would skip another monorepo's exports. Without an
+  `id` — only the first publisher ever wrote untagged trailers — they are counted as ours, as
+  before ids existed, and `doctor` notes the assumption.
+- **A foreign export an older monosplice skipped stops everything.** Before 1.1, `pull` read
+  every Source trailer as its own, so it skipped another monorepo's exports and imported the
+  commits after them without their changes. When a foreign commit on the standalone branch's
+  first-parent line sits between two sync points with no import of its own, every command
+  refuses, names the commit, and prints the by-hand import that brings it in (a
+  `git diff | git apply --3way` and a commit carrying `Monosplice-Origin: <sha>`).
 
-A rollout for a second monorepo: release a monosplice that knows ids to everyone first, then set
-`id` in the second monorepo and commit it, and only then push from it. An older monosplice in
-the first monorepo would read the second's tagged trailers as its own, broken ones.
+**Rollout is a hard precondition.** Every clone and CI runner that pulls or pushes the shared
+standalone repo — in every monorepo — must run monosplice 1.1.0 or later *before* the second
+monorepo publishes anything. Then set `id` in the second monorepo, commit it, and only then
+push from it. An older monosplice in the first monorepo reads the second's tagged trailers as
+its own: `push` calls them a broken mapping, and `pull` silently skips them, which 1.1 then
+refuses to build on until they are imported by hand.
 
 ### Hooks
 
