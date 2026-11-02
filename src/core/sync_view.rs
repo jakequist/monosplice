@@ -382,6 +382,8 @@ struct ClassifiedSources {
     foreign: usize,
     /// Of those, the ones with an untagged trailer.
     foreign_legacy: usize,
+    /// The foreign public commits themselves.
+    foreign_shas: HashSet<String>,
     legacy_assumed_shallow: bool,
 }
 
@@ -431,6 +433,7 @@ fn classify_sources(
 
     let mut out = ClassifiedSources {
         mine: HashMap::new(),
+        foreign_shas: HashSet::new(),
         foreign: 0,
         foreign_legacy: 0,
         legacy_assumed_shallow,
@@ -445,6 +448,7 @@ fn classify_sources(
             out.mine.insert(pub_sha.clone(), mine);
         } else if !foreign.is_empty() {
             out.foreign += 1;
+            out.foreign_shas.insert(pub_sha.clone());
             if foreign.iter().any(|source| source.id.is_none()) {
                 out.foreign_legacy += 1;
             }
@@ -474,6 +478,59 @@ fn legacy_group_is_mine(root: &Path, legacy: &[String]) -> Result<Legacy, GitErr
         return Ok(Legacy::Undecidable);
     }
     Ok(Legacy::Foreign)
+}
+
+/// Foreign public commits an older monosplice skipped, oldest first.
+///
+/// Before ids, every Source trailer read as "ours", so a 1.0 `pull` skipped another monorepo's
+/// export and imported the commit after it, diffed against the skipped one: its change never
+/// reached the monorepo. Ancestry now calls it reflected, and the next push would publish a tree
+/// without it. On the first-parent line below the last reflected commit, a foreign commit with
+/// no import of its own that sits *above* an earlier sync point (an import, or our own export)
+/// was stepped over. One below every sync point predates first contact and came in with the
+/// attach, so it is fine.
+fn find_skipped_foreign(
+    root: &Path,
+    last_reflected: &str,
+    foreign: &HashSet<String>,
+    imported: &HashSet<String>,
+    my_pubs: &HashSet<&String>,
+) -> Result<Vec<String>, GitError> {
+    if foreign.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut skipped: Vec<String> = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    for sha in rev_list(root, &["--first-parent", last_reflected])? {
+        if imported.contains(&sha) || my_pubs.contains(&sha) {
+            skipped.append(&mut pending);
+        } else if foreign.contains(&sha) {
+            pending.push(sha);
+        }
+    }
+    skipped.reverse();
+    Ok(skipped)
+}
+
+fn skipped_foreign_message(s: &ResolvedSubrepo, skipped: &[String]) -> String {
+    let commands: String = skipped
+        .iter()
+        .map(|sha| {
+            format!(
+                "  git diff --binary {sha}^ {sha} | git apply --index --3way --directory={}\n  git commit -m \"Import {sha} skipped by an older monosplice\" -m \"{ORIGIN_TRAILER}: {sha}\"\n",
+                s.path
+            )
+        })
+        .collect();
+    format!(
+        "{}: {} standalone commit(s) on {} published by another monorepo were never imported: {}.\nAn older monosplice (before 1.1) read their {SOURCE_TRAILER} trailers as this monorepo's own and skipped them, then imported later commits past them, so their changes are missing from {}/ — and a push would publish a tree without them.\nNothing was changed. From the monorepo root, import each by hand, oldest first, resolving any conflict before its commit, then run the command again:\n{}",
+        s.name,
+        skipped.len(),
+        pull_source(s),
+        skipped.join(", "),
+        s.path,
+        commands.trim_end(),
+    )
 }
 
 /// Derive every sync cursor from trailers. There is no state file: this runs on each
@@ -590,6 +647,19 @@ pub fn load_sync_view(
     )?;
 
     let last_reflected = find_last_reflected(root, &origin_by_mono, &pub_ancestors)?;
+    if let Some(reflected) = &last_reflected {
+        let my_pubs: HashSet<&String> = exported_mono_to_pub.values().collect();
+        let skipped = find_skipped_foreign(
+            root,
+            reflected,
+            &sources.foreign_shas,
+            &imported_pub_shas,
+            &my_pubs,
+        )?;
+        if !skipped.is_empty() {
+            return Err(SyncViewError::Unsafe(skipped_foreign_message(s, &skipped)));
+        }
+    }
     let (unreflected_pub, import_base) = find_unreflected_pub(
         root,
         &tracking_ref,

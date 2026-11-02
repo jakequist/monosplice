@@ -506,3 +506,68 @@ fn a_shallow_clone_of_a_monorepo_with_an_id_refuses_instead_of_guessing() {
     assert_eq!(shallow.read("core/two.txt"), "2\n");
     assert_eq!(fx.pub_repo.head(), pub_head);
 }
+
+/// Review finding 2: monosplice 1.0 read B's tagged export as its own and skipped it on pull,
+/// importing only the commit after it. Upgraded to 1.1, A sees that export as foreign, but
+/// reflected by ancestry — and its next push would publish a tree without B's file. A skipped
+/// foreign commit must stop every command until it is imported.
+#[test]
+fn a_foreign_export_an_older_monosplice_skipped_refuses_the_push() {
+    let fx = shared_fixture();
+    let b = b_attached(&fx);
+    b.commit("b feature", &[("core/fromb.txt", Some("b\n"))]);
+    run_ok(&b.dir, &["push"]);
+    let b_export = fx.pub_repo.head();
+    let contrib = clone_remote(fx.sandbox.path(), &fx.pub_dir, "contrib");
+    contrib.commit("outside c3", &[("c3.txt", Some("3\n"))]);
+    contrib.git(&["push", "-q", "origin", "main"]);
+    let c3 = fx.pub_repo.head();
+
+    // What a 1.0 `pull` did: skip B's export as "ours", import c3 alone, diffed against its parent.
+    fx.a.git(&["fetch", "-q", &fx.pub_dir, "main"]);
+    let diff = fx.a.git(&["diff", "--binary", &b_export, &c3]);
+    fx.a.git_with(
+        &["apply", "--index", "--directory=core", "-"],
+        &[],
+        Some(&format!("{diff}\n")),
+    );
+    fx.a.commit(&format!("outside c3\n\nMonosplice-Origin: {c3}"), &[]);
+    assert!(!fx.a.exists("core/fromb.txt"));
+
+    fx.a.commit("a two", &[("core/a2.txt", Some("a\n"))]);
+    for args in [
+        &["push"][..],
+        &["push", "--dry-run"][..],
+        &["status"][..],
+        &["pull"][..],
+    ] {
+        let res = run_monosplice(&fx.a.dir, args);
+        assert_ne!(res.exit_code, 0, "{args:?}: {}", res.stdout);
+        assert!(
+            res.stderr.contains(&b_export) && res.stderr.contains("older monosplice"),
+            "{args:?}: {}",
+            res.stderr
+        );
+    }
+    assert_eq!(fx.pub_repo.head(), c3, "nothing was published");
+    let doc = run_monosplice(&fx.a.dir, &["doctor"]);
+    assert_eq!(doc.exit_code, 1, "{}", doc.stdout);
+
+    // The recovery the message names: import the skipped commit by hand, then push.
+    let fix =
+        fx.a.git(&["diff", "--binary", &format!("{b_export}^"), &b_export]);
+    fx.a.git_with(
+        &["apply", "--index", "--3way", "--directory=core", "-"],
+        &[],
+        Some(&format!("{fix}\n")),
+    );
+    fx.a.commit(
+        &format!(
+            "Import {b_export} skipped by an older monosplice\n\nMonosplice-Origin: {b_export}"
+        ),
+        &[],
+    );
+    let push = run_ok(&fx.a.dir, &["push"]);
+    assert!(push.stdout.contains("exported"), "{}", push.stdout);
+    assert_eq!(fx.pub_repo.file_at("HEAD", "fromb.txt"), "b");
+}
