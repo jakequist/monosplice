@@ -693,6 +693,16 @@ pub fn run_ok(dir: &Path, args: &[&str]) -> RunResult {
 /// that starts with `git ` or `monosplice `, through `sh -c` in `repo` with the test git env.
 /// Panics when one fails. Returns the commands it ran.
 pub fn run_advice(repo: &TestRepo, message: &str) -> Vec<String> {
+    let (ran, failed) = try_run_advice(repo, message);
+    if let Some((cmd, output)) = failed {
+        panic!("advised command failed: {cmd}\n{output}");
+    }
+    ran
+}
+
+/// [`run_advice`], stopping at the first command that fails instead of panicking. Returns the
+/// commands that succeeded, and the failing one with its output.
+pub fn try_run_advice(repo: &TestRepo, message: &str) -> (Vec<String>, Option<(String, String)>) {
     let bin = env!("CARGO_BIN_EXE_monosplice");
     let mut ran = Vec::new();
     for line in message.lines() {
@@ -717,13 +727,15 @@ pub fn run_advice(repo: &TestRepo, message: &str) -> Vec<String> {
         let out = sh
             .output()
             .unwrap_or_else(|e| panic!("failed to run `{cmd}`: {e}"));
-        assert!(
-            out.status.success(),
-            "advised command failed: {cmd}\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        if !out.status.success() {
+            let output = format!(
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return (ran, Some((cmd, output)));
+        }
         ran.push(cmd);
     }
-    ran
+    (ran, None)
 }

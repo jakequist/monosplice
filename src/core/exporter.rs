@@ -604,7 +604,7 @@ pub fn check_import_order(
     let branch = git(root, &["symbolic-ref", "--short", "-q", "HEAD"]).ok();
     match (&view.export_base, branch) {
         (Some(base), Some(branch)) if !branch.is_empty() => message.push_str(&format!(
-            "Put the imports first and your commits on top of them. From the monorepo root (this rewrites {branch} from {base} on; if it is shared, do it on a copy):\n  git branch monosplice-local\n  git reset --hard {base}\n  monosplice pull {name}\n  git rebase --onto HEAD {base} monosplice-local\n  git checkout -B {branch}\n  git branch -D monosplice-local\n  monosplice push {name}\nThe rebase drops the old imports as already applied; if it stops on a conflict, resolve it and run `git rebase --continue`. Next time, pull before you commit."
+            "Put the imports first and your commits on top of them. From the monorepo root (this rewrites {branch} from {base} on; if {branch} is shared, see \"Imports go below your own work\" in monosplice's docs/reference.md instead):\n  # commit or stash your work first: reset --keep refuses rather than discard it\n  git branch monosplice-local\n  git reset --keep {base}\n  monosplice pull {name}\n  git rebase --onto HEAD {base} monosplice-local\n  git checkout -B {branch}\n  git branch -D monosplice-local\n  monosplice push {name}\nThe rebase drops the old imports as already applied; if it stops on a conflict, resolve it and run `git rebase --continue`. Next time, pull before you commit."
         )),
         _ => message.push_str(
             "Put the imports first and your commits on top of them (rebase your commits onto a fresh `monosplice pull`), then push again. Next time, pull before you commit.",

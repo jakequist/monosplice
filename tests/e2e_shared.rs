@@ -815,3 +815,45 @@ fn two_busy_publishers_do_not_echo_each_other() {
         "a local commit below an import must be refused once"
     );
 }
+
+/// Final review: the import-order advice must never throw away uncommitted work anywhere in the
+/// monorepo. Run as printed over a staged new file and an unstaged edit, either the work
+/// survives or the sequence stops with it intact.
+#[test]
+fn the_import_order_advice_never_discards_uncommitted_work() {
+    let fx = shared_fixture();
+    let b = b_attached(&fx);
+    b.commit("b1", &[("core/b1.txt", Some("1\n"))]);
+    fx.a.commit("a1", &[("core/a1.txt", Some("1\n"))]);
+    run_ok(&fx.a.dir, &["push"]);
+    run_ok(&b.dir, &["pull"]);
+
+    b.write("notes.txt", "uncommitted precious work\n");
+    b.git(&["add", "notes.txt"]);
+    b.write("app/main.ts", "edited, not staged\n");
+
+    let push = run_monosplice(&b.dir, &["push"]);
+    assert!(
+        push.stderr.contains("sit below an import"),
+        "{}",
+        push.stderr
+    );
+    let (_, failed) = common::try_run_advice(&b, &push.stderr);
+    assert!(
+        b.exists("notes.txt") && b.read("notes.txt") == "uncommitted precious work\n",
+        "staged work lost (stopped at: {failed:?})"
+    );
+    assert_eq!(
+        b.read("app/main.ts"),
+        "edited, not staged\n",
+        "unstaged edit lost"
+    );
+    // `reset --keep` resets the index, so the new file is no longer staged — but it is there,
+    // and the sequence stops at the first command a dirty tree refuses.
+    assert!(failed.is_some(), "a dirty tree must stop the sequence");
+    assert!(
+        push.stderr.contains("commit or stash your work first"),
+        "{}",
+        push.stderr
+    );
+}
