@@ -557,9 +557,22 @@ fn a_foreign_export_an_older_monosplice_skipped_refuses_the_push() {
     let refusal = run_monosplice(&fx.a.dir, &["push"]).stderr;
     let ran = common::run_advice(&fx.a, &refusal);
     assert_eq!(ran.len(), 2, "{ran:?}");
-    let push = run_ok(&fx.a.dir, &["push"]);
-    assert!(push.stdout.contains("exported"), "{}", push.stdout);
+    // "a two" now sits below that import, so push asks for the imports first; its advice
+    // re-imports on 1.1 from the last export and replays the local work on top.
+    let refusal = run_monosplice(&fx.a.dir, &["push"]);
+    assert!(
+        refusal.stderr.contains("sit below an import"),
+        "{}",
+        refusal.stderr
+    );
+    common::run_advice(&fx.a, &refusal.stderr);
     assert_eq!(fx.pub_repo.file_at("HEAD", "fromb.txt"), "b");
+    assert_eq!(fx.pub_repo.file_at("HEAD", "a2.txt"), "a");
+    let new = fx.pub_repo.git(&["rev-list", &format!("{c3}..HEAD")]);
+    assert_eq!(new.lines().count(), 1, "only a two is new: {new}");
+    for commit in new.lines() {
+        assert!(deleted_files(&fx, commit).is_empty(), "{commit}");
+    }
 }
 
 // --- round 2 review: the skipped-foreign guard must not fire on healthy histories ---
@@ -624,8 +637,8 @@ fn a_reattach_by_snapshot_is_not_a_skipped_foreign_commit() {
     run_ok(&b.dir, &["attach", "core", &fx.pub_dir, "--import-history"]);
     b.commit("b feature", &[("core/fromb.txt", Some("b\n"))]);
     run_ok(&b.dir, &["push"]);
-    fx.a.commit("a2", &[("core/a2.txt", Some("a\n"))]);
     run_ok(&fx.a.dir, &["pull"]);
+    fx.a.commit("a2", &[("core/a2.txt", Some("a\n"))]);
     run_ok(&fx.a.dir, &["push"]);
 
     run_ok(&b.dir, &["detach", "core"]);
@@ -704,5 +717,82 @@ fn a_fetched_remote_does_not_make_another_monorepo_s_trailers_ours() {
             && doc.stdout.contains("no ancestor of HEAD"),
         "{}",
         doc.stdout
+    );
+}
+
+// --- round 2 review finding 1: two busy publishers must not echo each other ---
+
+/// Files a public commit deletes, relative to its first parent.
+fn deleted_files(fx: &SharedFixture, commit: &str) -> Vec<String> {
+    let out = fx.pub_repo.git(&[
+        "diff-tree",
+        "-r",
+        "--no-commit-id",
+        "--name-only",
+        "--diff-filter=D",
+        &format!("{commit}^"),
+        commit,
+    ]);
+    out.lines().map(str::to_string).collect()
+}
+
+/// Commit, pull, push — and when push refuses because the local commit sits below an import,
+/// follow its advice to the letter.
+fn commit_pull_push(repo: &TestRepo, file: &str) -> bool {
+    repo.commit(
+        file,
+        &[(&format!("core/{file}"), Some(&format!("{file}\n")))],
+    );
+    run_ok(&repo.dir, &["pull"]);
+    let push = run_monosplice(&repo.dir, &["push"]);
+    if push.exit_code == 0 {
+        return false;
+    }
+    assert!(
+        push.stderr.contains("sit below an import") && push.stderr.contains("git rebase"),
+        "{}",
+        push.stderr
+    );
+    let ran = common::run_advice(repo, &push.stderr);
+    assert!(
+        ran.last().is_some_and(|c| c.ends_with("push core")),
+        "{ran:?}"
+    );
+    true
+}
+
+#[test]
+fn two_busy_publishers_do_not_echo_each_other() {
+    let fx = shared_fixture();
+    let b = b_attached(&fx);
+    let before = pub_count(&fx);
+    let pub_before = fx.pub_repo.head();
+
+    let mut refused = 0;
+    for r in 1..=2 {
+        refused += usize::from(commit_pull_push(&b, &format!("b{r}.txt")));
+        refused += usize::from(commit_pull_push(&fx.a, &format!("a{r}.txt")));
+    }
+    assert_eq!(pub_count(&fx), before + 4, "one public commit per change");
+    let new = fx
+        .pub_repo
+        .git(&["rev-list", &format!("{pub_before}..HEAD")]);
+    for commit in new.lines() {
+        assert!(
+            deleted_files(&fx, commit).is_empty(),
+            "{commit} deletes {:?}",
+            deleted_files(&fx, commit)
+        );
+    }
+    for repo in [&fx.a, &b] {
+        run_ok(&repo.dir, &["pull"]);
+        assert_eq!(
+            repo.tree_sha("HEAD", Some("core")),
+            fx.pub_repo.tree_sha("HEAD", None)
+        );
+    }
+    assert!(
+        refused > 0,
+        "a local commit below an import must be refused once"
     );
 }

@@ -150,6 +150,8 @@ pub struct SyncView {
     /// How many of those carry an untagged (legacy) trailer. A monorepo with no `id` must not
     /// publish beside them: its own untagged trailers would be indistinguishable from theirs.
     pub foreign_legacy_sources: usize,
+    /// The public commits [`SyncView::foreign_sources`] counts.
+    pub foreign_pub_shas: HashSet<String>,
     /// No untagged trailer is an ancestor of HEAD, but this is a shallow clone, so they were
     /// counted as ours rather than another monorepo's: the history that would decide is missing.
     pub legacy_assumed_shallow: bool,
@@ -175,6 +177,7 @@ pub fn unpublished_view(name: &str) -> SyncView {
         related: false,
         foreign_sources: 0,
         foreign_legacy_sources: 0,
+        foreign_pub_shas: HashSet::new(),
         legacy_assumed_shallow: false,
         legacy_off_head: false,
     }
@@ -748,6 +751,7 @@ pub fn load_sync_view(
         related,
         foreign_sources: sources.foreign,
         foreign_legacy_sources: sources.foreign_legacy,
+        foreign_pub_shas: sources.foreign_shas,
         legacy_assumed_shallow: sources.legacy_assumed_shallow,
         legacy_off_head: sources.legacy_off_head,
     })

@@ -10,8 +10,8 @@ use std::path::Path;
 use crate::config::{ResolvedSubrepo, CONFIG_FILENAME};
 use crate::core::filter::{anchor_subtree, filtered_subtree, FilterError};
 use crate::core::git::{
-    commit_tree, git, git_ok, push_ref, push_ref_with_lease, read_commit, rev_list, CommitMeta,
-    CommitTreeInput, GitError, EMPTY_TREE,
+    commit_subjects, commit_tree, git, git_ok, push_ref, push_ref_with_lease, read_commit,
+    rev_list, CommitMeta, CommitTreeInput, GitError, EMPTY_TREE,
 };
 use crate::core::hooks::{run_rewrite_message, HookError};
 use crate::core::sync_view::{
@@ -503,6 +503,114 @@ pub fn check_export_preconditions(
     }
 
     None
+}
+
+/// Does this import change the publishable subtree exactly as its public commit changed the
+/// public tree? Then it applied cleanly, and the work it carries is upstream's alone. A
+/// conflicted import that the user resolved differs — its resolution is new work, and it must
+/// export (CLAUDE.md).
+fn import_applied_cleanly(
+    root: &Path,
+    subrepo: &ResolvedSubrepo,
+    import: &str,
+    pub_sha: &str,
+) -> Result<bool, ExportError> {
+    let mono_before = anchor_subtree(root, &format!("{import}^"), subrepo)?
+        .unwrap_or_else(|| EMPTY_TREE.to_string());
+    let Some(mono_after) = anchor_subtree(root, import, subrepo)? else {
+        return Ok(false);
+    };
+    let pub_before = git(root, &["rev-parse", &format!("{pub_sha}^1^{{tree}}")])
+        .unwrap_or_else(|_| EMPTY_TREE.to_string());
+    let pub_after = git(root, &["rev-parse", &format!("{pub_sha}^{{tree}}")])?;
+    let diff = |a: &str, b: &str| git(root, &["diff-tree", "-r", "--no-renames", a, b]);
+    Ok(diff(&mono_before, &mono_after)? == diff(&pub_before, &pub_after)?)
+}
+
+/// Refuse when local commits under the subrepo sit below a clean import of another monorepo's
+/// export. Export replays in monorepo order, so it would publish the local commits first, on a
+/// tip that already has the import's changes but from trees that lack them — a temporary
+/// deletion — and then the import again on top. The other monorepo pulls that back as new work,
+/// lands it on its own local commits, and the two echo each other forever.
+///
+/// "Below a clean import" only: an import whose change differs from its public commit's is a
+/// resolved conflict, and that resolution must export as it always has.
+pub fn check_import_order(
+    root: &Path,
+    subrepo: &ResolvedSubrepo,
+    view: &SyncView,
+    candidates: &[ExportCandidate],
+) -> Result<Option<String>, ExportError> {
+    if view.foreign_pub_shas.is_empty() {
+        return Ok(None);
+    }
+    let mut locals: Vec<&str> = Vec::new();
+    let mut stuck: Vec<&str> = Vec::new();
+    let mut imports: Vec<(&str, String)> = Vec::new();
+    for candidate in candidates {
+        let sha = candidate.mono_sha.as_str();
+        let meta = read_commit(root, sha)?;
+        let Some(origin) = get_trailer(&meta.message, ORIGIN_TRAILER) else {
+            locals.push(sha);
+            continue;
+        };
+        if !view.foreign_pub_shas.contains(&origin) {
+            continue;
+        }
+        let below: Vec<&str> = locals
+            .iter()
+            .copied()
+            .filter(|local| git_ok(root, &["merge-base", "--is-ancestor", local, sha]))
+            .collect();
+        if below.is_empty() || !import_applied_cleanly(root, subrepo, sha, &origin)? {
+            continue;
+        }
+        for local in below {
+            if !stuck.contains(&local) {
+                stuck.push(local);
+            }
+        }
+        imports.push((sha, origin));
+    }
+    if stuck.is_empty() {
+        return Ok(None);
+    }
+
+    let list = |shas: &[String]| -> Result<String, ExportError> {
+        let subjects = commit_subjects(root, shas)?;
+        Ok(shas
+            .iter()
+            .map(|sha| {
+                format!(
+                    "    {} {}",
+                    &sha[..10.min(sha.len())],
+                    subjects.get(sha).map(String::as_str).unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"))
+    };
+    let stuck: Vec<String> = stuck.into_iter().map(str::to_string).collect();
+    let import_shas: Vec<String> = imports.iter().map(|(sha, _)| sha.to_string()).collect();
+    let name = &subrepo.name;
+    let mut message = format!(
+        "{name}: {} local commit(s) under {}/ sit below an import of another monorepo's export:\n{}\nimported on top of them:\n{}\nA push would publish your commits first, from trees without the imported changes (deleting them on {} for a commit), then the import again — which the other monorepo pulls back as new work, so the two echo each other. Nothing was pushed.\n",
+        stuck.len(),
+        subrepo.path,
+        list(&stuck)?,
+        list(&import_shas)?,
+        subrepo.remote,
+    );
+    let branch = git(root, &["symbolic-ref", "--short", "-q", "HEAD"]).ok();
+    match (&view.export_base, branch) {
+        (Some(base), Some(branch)) if !branch.is_empty() => message.push_str(&format!(
+            "Put the imports first and your commits on top of them. From the monorepo root (this rewrites {branch} from {base} on; if it is shared, do it on a copy):\n  git branch monosplice-local\n  git reset --hard {base}\n  monosplice pull {name}\n  git rebase --onto HEAD {base} monosplice-local\n  git checkout -B {branch}\n  git branch -D monosplice-local\n  monosplice push {name}\nThe rebase drops the old imports as already applied; if it stops on a conflict, resolve it and run `git rebase --continue`. Next time, pull before you commit."
+        )),
+        _ => message.push_str(
+            "Put the imports first and your commits on top of them (rebase your commits onto a fresh `monosplice pull`), then push again. Next time, pull before you commit.",
+        ),
+    }
+    Ok(Some(message))
 }
 
 /// The first public commit: the subrepo's current tree as one parentless commit. Returns
