@@ -10,10 +10,23 @@ brain and submodule-free ergonomics."
   histories. Monosplice replays commits across the boundary and records the correspondence.
   We never try to make the public repo a deterministic filter of monorepo history.
 - **Trailers are the source of truth for the commit mapping.**
-  - Exported public commits carry `Monosplice-Source: <monorepo-sha>`.
+  - Exported public commits carry `Monosplice-Source: <monorepo-sha> <id>`, where `id` is the
+    optional top-level config key naming the monorepo; with no `id`, the legacy
+    `Monosplice-Source: <monorepo-sha>`. Parsers accept both.
   - Imported monorepo commits carry `Monosplice-Origin: <public-sha>` — the marker that a pub
     commit is reflected in mono (so `pull` skips it and `push` stops refusing).
-  - Import skips pub commits with `Monosplice-Source` (our own exports).
+  - **Several monorepos may publish to one pub repo, so a Source trailer is ours only when it
+    says so.** Tagged with our id: ours. Tagged with another id: foreign. Untagged (legacy):
+    one group per subrepo, ours when any of them names an ancestor of HEAD, foreign otherwise
+    (in a shallow clone, which cannot tell, ours — and `doctor` notes it). Only our trailers
+    feed the export map, `related`, the broken/superseded scans and the pull filter; foreign
+    ones are counted for `doctor` and never relate two repos on their own.
+  - Import skips pub commits with *our* `Monosplice-Source` (our own exports). Another
+    monorepo's exports are ordinary pub commits: imported like any contribution, keeping their
+    foreign trailer in the imported message.
+  - Export removes every `Monosplice-Source` line from the outgoing message (after
+    `rewrite-message`) and appends exactly one, ours. With no `id`, export refuses beside
+    foreign *untagged* trailers: two untagged publishers cannot be told apart.
   - Export does NOT skip by trailer: a pure import's tree already equals the pub tip, so the
     tree-equality no-op check drops it; a *conflicted* import (merge of mono + pub edits)
     differs from the pub tip and MUST export, or the resolution would be lost. This is what

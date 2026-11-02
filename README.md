@@ -154,7 +154,10 @@ No magic, no daemon, no lock-in.
 **Two histories, one mapping.** The monorepo and each standalone repo have independent
 histories; monosplice replays commits between them and records the correspondence in commit
 trailers (the `Key: value` lines git keeps at the end of a commit message) — exports carry
-`Monosplice-Source: <monorepo-sha>`, imports carry `Monosplice-Origin: <standalone-sha>`. Each
+`Monosplice-Source: <monorepo-sha>` (tagged with the monorepo's `id`, when it has one), imports
+carry `Monosplice-Origin: <standalone-sha>`. Several monorepos can splice the same standalone
+repo: each recognises its own trailers and pulls the others' exports like any contribution —
+see [several monorepos, one standalone repo](docs/reference.md#several-monorepos-one-standalone-repo). Each
 export is built with git plumbing (`ls-tree`, `mktree`, `commit-tree`) and preserves the
 original author and dates. The remote ref is written exactly once — after every commit and
 every hook has succeeded. Commits that touch nothing exportable produce no commit on the
@@ -176,7 +179,7 @@ correct, only the sha was stale. Anything that actually changed the published tr
 Clones made *after* someone else's rebase inherit the other half of that story — an old public
 commit naming a sha nobody has any more. Validation stops at the newest anchor that resolves,
 so a dead trailer behind a live one is reported as history and blocks nothing; only a dead
-anchor with nothing readable above it (a shallow clone, the wrong remote) refuses. The same
+anchor with nothing readable above it (a shallow clone, say) refuses. The same
 rule runs in the import direction: re-baseline a subrepo onto a brand-new repository and the old
 `Monosplice-Origin` trailers below the live anchor become history too — reported, never fatal.
 
@@ -221,6 +224,9 @@ remote = "git@github.com:you/core.git"
 scan = "if grep -rIqE 'AKIA[0-9A-Z]{16}' .; then echo 'AWS key in the outgoing tree' >&2; exit 1; fi"
 ```
 
+When more than one monorepo publishes to the same standalone repo, give each but the first an
+`id = "<name>"` line at the top of its config, before the first `[[subrepos]]`.
+
 Every key, and the exact contract the hooks run under, is in
 [configuration & hooks](docs/reference.md#configuration). Coming from a
 `monosplice.config.ts`? [Migrating from monosplice.config.ts/js](docs/reference.md#migrating-from-monospliceconfigtsjs)
@@ -258,10 +264,11 @@ Things monosplice won't do, listed here so you don't find out the hard way:
 - **One branch per subrepo.** monosplice syncs the configured branch (default `main`) and
   nothing else; feature-branch export is on the roadmap.
 - **Exported commits are watermarked.** Every export carries a
-  `Monosplice-Source: <monorepo-sha>` trailer. That trailer *is* the sync mapping, so
-  `rewrite-message` runs before it is appended and cannot strip it — private-monorepo SHAs
-  appear in standalone-repo history, permanently. They reveal nothing but 40 hex characters,
-  but know it's there before you publish.
+  `Monosplice-Source: <monorepo-sha>` trailer, followed by the monorepo's `id` when the config
+  sets one. That trailer *is* the sync mapping, so `rewrite-message` runs before it is appended
+  and cannot strip it — private-monorepo SHAs (and the `id`) appear in standalone-repo history,
+  permanently. They reveal nothing but 40 hex characters and the name you chose, but know
+  they're there before you publish.
 - **No shallow clones.** Sync state is re-derived by walking history, so a shallow monorepo
   clone stops with an error rather than guessing.
 - **`status` talks to the network by default.** Re-deriving state is a couple of `git log`

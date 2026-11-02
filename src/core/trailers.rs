@@ -1,10 +1,13 @@
 //! Trailer keys that record the cross-repo commit mapping.
 //!
-//! - Public commits exported from the monorepo carry `Monosplice-Source: <mono-sha>`.
+//! - Public commits exported from the monorepo carry `Monosplice-Source: <mono-sha> <id>`, or
+//!   the legacy `Monosplice-Source: <mono-sha>` when the monorepo has no `id`.
 //! - Monorepo commits imported from a public repo carry `Monosplice-Origin: <pub-sha>`,
 //!   marking that pub commit as reflected in the monorepo.
 //!
-//! Import skips pub commits carrying Monosplice-Source (our own exports). Export
+//! Import skips pub commits carrying *our* Monosplice-Source (our own exports); which
+//! trailers are ours is decided in `sync_view`, since several monorepos may publish to one
+//! public repo. Export
 //! relies on tree equality, not trailers: pure imports are no-ops against the pub
 //! tip and get dropped, while conflicted imports (merges of mono + pub edits)
 //! export their resolution. Together these prevent ping-pong without ever losing

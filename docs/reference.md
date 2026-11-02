@@ -271,6 +271,65 @@ Error: Invalid config at /repo/monosplice.toml:
 A config with no `[[subrepos]]` at all is valid — it means "nothing attached yet", which is
 exactly the state `init` leaves you in.
 
+One key sits outside the blocks: an optional `id` naming the monorepo itself. It must come
+before the first `[[subrepos]]` — TOML would otherwise file it under that subrepo, and the
+config is refused with a message saying where it belongs — and it is lowercase letters, digits
+and hyphens. You need it only when [several monorepos publish to the same standalone
+repo](#several-monorepos-one-standalone-repo).
+
+```toml
+id = "pearly"
+
+[[subrepos]]
+path = "vendor/bolide"
+remote = "https://github.com/you/bolide.git"
+```
+
+## Several monorepos, one standalone repo
+
+A standalone repo can be spliced into more than one monorepo: one publishes it, another vendors
+it and sends patches back the same way. Each monorepo must tell its own exports from the
+others', and the `Monosplice-Source` trailer is how: with `id` set, every export is tagged
+`Monosplice-Source: <monorepo-sha> <id>`; without one it is the legacy
+`Monosplice-Source: <monorepo-sha>`, which is what every monorepo wrote before ids existed.
+
+Each run classifies the trailers on the standalone branch:
+
+| Trailer | Whose |
+| --- | --- |
+| tagged with this monorepo's `id` | ours |
+| tagged with another `id` | another monorepo's |
+| untagged (legacy) | judged as one group per subrepo: ours if any of them names an ancestor of `HEAD`, another monorepo's otherwise |
+
+Only our own trailers decide what is already published, what counts as a broken mapping, and
+what `pull` skips. Another monorepo's exports are ordinary standalone commits here: `attach
+--import-history` and `pull` replay them like any outside contribution, keeping their trailer
+in the imported message, and they never on their own make `attach` think the two repositories
+are already connected. `doctor` counts them in one note: `N commit(s) published by another
+monorepo`.
+
+When an exported commit already carries a `Monosplice-Source` line — a conflicted import of
+another monorepo's export does — `push` removes every such line (after `rewrite-message`) and
+appends exactly one, its own.
+
+The rules that keep two publishers apart:
+
+- **The first publisher may keep going without an `id`.** Its untagged trailers name its own
+  history, so they stay its own. Setting `id` later is safe too: old untagged and new tagged
+  trailers are both recognised.
+- **Every other publisher needs an `id`.** A monorepo with no `id` refuses to `push` beside
+  another monorepo's untagged trailers, and says to set one: its own untagged exports would be
+  indistinguishable from theirs. Pulling is never refused.
+- **Ids must be unique.** A trailer tagged with your own id that names a commit you do not have
+  is a broken mapping, as before; `doctor` reports it with a `duplicate id?` hint, and `push`
+  refuses.
+- **Shallow clones** cannot see whether an untagged trailer names their own history, so there
+  they are counted as ours, exactly as before ids existed, and `doctor` notes the assumption.
+
+A rollout for a second monorepo: release a monosplice that knows ids to everyone first, then set
+`id` in the second monorepo and commit it, and only then push from it. An older monosplice in
+the first monorepo would read the second's tagged trailers as its own, broken ones.
+
 ### Hooks
 
 Hooks are shell commands. All three run **per exported commit**, against the tree that commit
@@ -311,7 +370,8 @@ the object database is written.
 `rewrite-message` is the odd one out: it shapes the commit, not the tree, so it runs from the
 monorepo root with the original message on **stdin** and the rewritten message expected on
 **stdout**. It runs *before* the `Monosplice-Source` trailer is appended, so you cannot
-accidentally strip it.
+accidentally strip it; any `Monosplice-Source` line still in its output is removed before
+monosplice appends its own.
 
 Worked examples, one of each:
 

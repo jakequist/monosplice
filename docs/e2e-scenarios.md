@@ -207,3 +207,21 @@ subrepo, `core/` = the configured subrepo path.
 - [x] S169 Upstream's first-parent line bypasses a commit the monorepo already imported: `main` gets `fixB` (pulled), a side branch from `fixB^` adds `featA` to the same CHANGELOG line, merges `main` in (first parent `featA`), and `main` is fast-forwarded to that merge → `status` reports exactly 1 to pull, and `pull` exits 0 with ONE import carrying `Monosplice-Origin: <merge>`, diffed against the imported `fixB` rather than its first parent — `featA` is never replayed onto content it did not see. `core/` equals the pub head's tree, the CHANGELOG has each entry exactly once, and a second `pull`/`status` report nothing to pull. Same with disjoint files: each change lands once.
 - [x] S170 The S169 shape with an unrelated committed local edit elsewhere in `core/` → `pull` still exits 0, the local edit is preserved and upstream's merged content is present.
 - [x] S171 A side branch with no commits of its own syncs `main` in with `merge --no-ff` from `fixB^`, and `main` fast-forwards to that merge; the monorepo has a committed local edit on the very line `fixB` changed → nothing on the first-parent line is dropped, but the merge is still diffed against the imported `fixB` (not its own first parent, which predates it), so `fixB` is never re-applied: `pull` exits 0 with exactly one import carrying `Monosplice-Origin: <merge>`, and the local edit is intact with no duplicated line.
+
+## Several monorepos, one standalone repo
+
+> Monorepo A (no `id`) publishes `core/` first; B (`id = "b"`) splices the same standalone repo
+> later. Each must read the other's exports as ordinary public commits. Tests:
+> `tests/e2e_shared.rs`, plus unit tests in `config.rs`, `trailers.rs` and `sync_view.rs`.
+
+- [x] S180 `id` is an optional top-level key, lowercase letters, digits and hyphens; anything else, or an `id` after the first `[[subrepos]]`, is refused naming the field. Exports are tagged `Monosplice-Source: <sha> <id>`; without `id`, the legacy `<sha>`. Parsers read both.
+- [x] S181 B `attach core <url> --import-history` (unconfigured) and `attach core --import-history` (configured) on A's published history replay every public commit; `core/` equals the pub head's tree; the imports keep A's Source trailer next to their Origin; `status` says in sync.
+- [x] S182 B `attach core <url>` (snapshot) → `status` in sync, `doctor` exits 0 with one note: `N commit(s) published by another monorepo` (in `--json` too).
+- [x] S183 A publishes one more commit → B `status` says `1 to pull`, `pull` imports it, `push` is up to date.
+- [x] S184 B exports: the pub commit carries `Monosplice-Source: <sha> b`. A pulls it, A `push` is up to date, B `pull` is up to date; a second round each way adds exactly one pub commit per change, and `doctor` is clean on both.
+- [x] S185 A conflicted import in B (A and B edited the same line) is exported carrying only B's Source trailer; A pulls it and the resolution survives.
+- [x] S186 B pushing before importing A's newer export is refused with "Run `monosplice pull core` first"; nothing is pushed.
+- [x] S187 A monorepo with no `id` beside another monorepo's untagged trailers: `push` and `push --dry-run` are refused, saying to set `id`; nothing is pushed; `pull` still works.
+- [x] S188 Two monorepos with the same id: the second's `doctor` reports the unresolvable trailer as a problem with a `duplicate id?` hint, and its `push` refuses; nothing is published.
+- [x] S189 A's untagged trailers stay A's: with one rebased away (superseded, not foreign), in a fresh clone, and in a shallow clone (counted as A's, as before; `doctor` notes the assumption).
+- [x] S190 A sets `id = "a"` later: old untagged and new tagged trailers are both A's, and `doctor` is clean; B pulls A's tagged export like any other.
