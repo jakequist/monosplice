@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::config::ResolvedSubrepo;
+use crate::config::{ResolvedSubrepo, CONFIG_FILENAME};
 use crate::core::filter::{anchor_subtree, filtered_subtree, FilterError};
 use crate::core::git::{
     commit_tree, git, git_ok, push_ref, push_ref_with_lease, read_commit, rev_list, CommitMeta,
@@ -19,7 +19,7 @@ use crate::core::sync_view::{
     SyncViewOptions,
 };
 use crate::core::trailers::{
-    append_trailer, format_source, get_trailer, ORIGIN_TRAILER, SOURCE_TRAILER,
+    append_trailer, format_source, get_trailer, remove_trailer, ORIGIN_TRAILER, SOURCE_TRAILER,
 };
 
 #[derive(Debug, Clone)]
@@ -181,7 +181,14 @@ pub fn compute_exports(
         if let Some(cmd) = &subrepo.rewrite_message {
             message = run_rewrite_message(cmd, root, &subrepo.name, &meta.sha, &meta.message)?;
         }
-        message = append_trailer(&message, SOURCE_TRAILER, &meta.sha);
+        // Exactly one Source trailer, ours: an imported commit still carries the one the
+        // other monorepo wrote, and two would claim the public commit for both.
+        message = remove_trailer(&message, SOURCE_TRAILER);
+        message = append_trailer(
+            &message,
+            SOURCE_TRAILER,
+            &format_source(&meta.sha, subrepo.monorepo_id.as_deref()),
+        );
 
         planned.push(PlannedExport {
             mono_sha: meta.sha.clone(),
@@ -477,6 +484,15 @@ pub fn check_export_preconditions(
         ));
     }
 
+    if subrepo.monorepo_id.is_none() && view.foreign_legacy_sources > 0 {
+        return Some(format!(
+            "{}: {} commit(s) on {} were published by another monorepo with untagged {SOURCE_TRAILER} trailers, and this monorepo has no `id` either, so its exports would be indistinguishable from theirs.\nNothing was pushed. Set `id = \"<name>\"` at the top of {CONFIG_FILENAME}, before the first [[subrepos]] — lowercase letters, digits and hyphens, unique to this monorepo — commit it, then push again.",
+            subrepo.name,
+            view.foreign_legacy_sources,
+            subrepo.remote,
+        ));
+    }
+
     if export_base_rewritten(root, view) {
         return Some(format!(
             "{}: the last exported monorepo commit {} is no longer an ancestor of HEAD.\nMonorepo history was rewritten (rebase, amend or force-push) underneath it, so monosplice cannot tell which commits are new. Nothing was pushed to {}.\nRun `monosplice doctor` for details, then restore that commit (`git reflog`) before pushing again.",
@@ -515,7 +531,7 @@ pub fn publish_baseline(
             message: append_trailer(
                 &format!("Initial import of {}\n", subrepo.name),
                 SOURCE_TRAILER,
-                &meta.sha,
+                &format_source(&meta.sha, subrepo.monorepo_id.as_deref()),
             ),
             author_name: meta.committer_name.clone(),
             author_email: meta.committer_email.clone(),
