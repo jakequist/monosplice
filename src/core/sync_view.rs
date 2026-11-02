@@ -13,7 +13,7 @@ use crate::core::git::{
     existing_commits, fetch_branch, git, git_ok, git_with, ls_remote_branch, missing_objects,
     rev_list, rev_parse, trailer_values, GitError, GitOpts,
 };
-use crate::core::trailers::{ORIGIN_TRAILER, SOURCE_TRAILER};
+use crate::core::trailers::{parse_source, SourceRef, ORIGIN_TRAILER, SOURCE_TRAILER};
 
 /// Where a subrepo's public branch is mirrored inside the monorepo's object db.
 pub fn remote_tracking_ref(name: &str) -> String {
@@ -88,6 +88,8 @@ pub struct ForkState {
 pub struct BrokenSourceRef {
     pub pub_sha: String,
     pub mono_sha: String,
+    /// The id the trailer was tagged with; `None` for a legacy trailer.
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +139,16 @@ pub struct SyncView {
     /// branch has history, but nothing on either side references the other, so the only safe
     /// move is `monosplice attach`.
     pub related: bool,
+    /// Public commits whose `Monosplice-Source` belongs to another monorepo. They are ordinary
+    /// public history here: imported like any outside contribution, and only counted for
+    /// `doctor`.
+    pub foreign_sources: usize,
+    /// How many of those carry an untagged (legacy) trailer. A monorepo with no `id` must not
+    /// publish beside them: its own untagged trailers would be indistinguishable from theirs.
+    pub foreign_legacy_sources: usize,
+    /// No untagged trailer is an ancestor of HEAD, but this is a shallow clone, so they were
+    /// counted as ours rather than another monorepo's: the history that would decide is missing.
+    pub legacy_assumed_shallow: bool,
 }
 
 /// The view of a subrepo whose public branch does not exist yet.
@@ -154,6 +166,9 @@ pub fn unpublished_view(name: &str) -> SyncView {
         broken_source_refs: Vec::new(),
         superseded_source_refs: Vec::new(),
         related: false,
+        foreign_sources: 0,
+        foreign_legacy_sources: 0,
+        legacy_assumed_shallow: false,
     }
 }
 
@@ -273,7 +288,7 @@ fn find_unreflected_pub(
     root: &Path,
     tracking_ref: &str,
     imported_pub_shas: &HashSet<String>,
-    source_by_pub: &HashMap<String, Vec<String>>,
+    source_by_pub: &HashMap<String, Vec<SourceRef>>,
     last_reflected: Option<&str>,
 ) -> Result<(Vec<String>, Option<String>), GitError> {
     // A forged or force-pushed-away Origin value would abort the whole rev-list, so only
@@ -355,6 +370,84 @@ fn find_last_reflected(
     Ok(None)
 }
 
+/// The public branch's `Monosplice-Source` trailers, split by which monorepo wrote them.
+struct ClassifiedSources {
+    /// pub sha -> this monorepo's trailers on it. The only ones that feed the mapping.
+    mine: HashMap<String, Vec<SourceRef>>,
+    /// Public commits whose every Source trailer is another monorepo's.
+    foreign: usize,
+    /// Of those, the ones with an untagged trailer.
+    foreign_legacy: usize,
+    legacy_assumed_shallow: bool,
+}
+
+/// Several monorepos may publish to one public repo, so a Source trailer is ours only when it
+/// says so. A tagged trailer (`<sha> <id>`) is ours exactly when the id is ours. Untagged ones
+/// predate ids and say nothing, so they are judged as one group per subrepo: ours when any of
+/// them names an ancestor of HEAD — the first publisher's history always contains its own
+/// exports, nobody else's does. A shallow clone cannot see that history, so there the group
+/// stays ours, as it always was, and the view says the assumption was made.
+fn classify_sources(
+    root: &Path,
+    pub_walk: &[String],
+    all_sources: &HashMap<String, Vec<String>>,
+    my_id: Option<&str>,
+) -> Result<ClassifiedSources, GitError> {
+    let parsed: HashMap<&String, Vec<SourceRef>> = all_sources
+        .iter()
+        .map(|(pub_sha, values)| (pub_sha, values.iter().map(|v| parse_source(v)).collect()))
+        .collect();
+
+    let mut legacy: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for pub_sha in pub_walk {
+        for source in parsed.get(pub_sha).into_iter().flatten() {
+            if source.id.is_none() && seen.insert(&source.mono_sha) {
+                legacy.push(source.mono_sha.clone());
+            }
+        }
+    }
+    let (legacy_mine, legacy_assumed_shallow) = legacy_group_is_mine(root, &legacy)?;
+
+    let mut out = ClassifiedSources {
+        mine: HashMap::new(),
+        foreign: 0,
+        foreign_legacy: 0,
+        legacy_assumed_shallow,
+    };
+    for (pub_sha, sources) in parsed {
+        let (mine, foreign): (Vec<SourceRef>, Vec<SourceRef>) =
+            sources.into_iter().partition(|source| match &source.id {
+                Some(id) => Some(id.as_str()) == my_id,
+                None => legacy_mine,
+            });
+        if !mine.is_empty() {
+            out.mine.insert(pub_sha.clone(), mine);
+        } else if !foreign.is_empty() {
+            out.foreign += 1;
+            if foreign.iter().any(|source| source.id.is_none()) {
+                out.foreign_legacy += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Are the untagged trailers (newest first) this monorepo's? Returns `(mine, assumed)`, where
+/// `assumed` means only the shallow-clone rule made them ours.
+fn legacy_group_is_mine(root: &Path, legacy: &[String]) -> Result<(bool, bool), GitError> {
+    if legacy.is_empty() || rev_parse(root, "HEAD").is_none() {
+        return Ok((false, false));
+    }
+    for sha in existing_commits(root, legacy)? {
+        if git_ok(root, &["merge-base", "--is-ancestor", &sha, "HEAD"]) {
+            return Ok((true, false));
+        }
+    }
+    let shallow = git(root, &["rev-parse", "--is-shallow-repository"])? == "true";
+    Ok((shallow, shallow))
+}
+
 /// Derive every sync cursor from trailers. There is no state file: this runs on each
 /// invocation. `ls_remote_branch` goes first so an unreachable remote fails with a GitError
 /// carrying git's own stderr, and a missing branch is reported as "not published yet" rather
@@ -401,19 +494,23 @@ pub fn load_sync_view(
         fetch_branch(root, source, &s.branch, &tracking_ref)?;
     }
 
-    let source_by_pub = trailer_values(root, SOURCE_TRAILER, &[&tracking_ref])?;
-
-    // The pub walk drives both the mapping and the broken-ref scan. Newest first, so the
-    // newest public commit claiming a monorepo commit is the one the mapping records — the
-    // insertion order of the TS `Map`, made explicit because a Rust HashMap has none.
+    // The pub walk drives the classification, the mapping and the broken-ref scan. Newest
+    // first, so the newest public commit claiming a monorepo commit is the one the mapping
+    // records — the insertion order of the TS `Map`, made explicit because a Rust HashMap has
+    // none.
     let pub_walk = rev_list(root, &[&tracking_ref])?;
+    let all_sources = trailer_values(root, SOURCE_TRAILER, &[&tracking_ref])?;
+    let sources = classify_sources(root, &pub_walk, &all_sources, s.monorepo_id.as_deref())?;
+    let source_by_pub = sources.mine;
+
     let mut exported_mono_to_pub: HashMap<String, String> = HashMap::new();
     let mut exported_mono_order: Vec<String> = Vec::new();
     for pub_sha in &pub_walk {
         let Some(values) = source_by_pub.get(pub_sha) else {
             continue;
         };
-        for mono_sha in values {
+        for source in values {
+            let mono_sha = &source.mono_sha;
             if !exported_mono_to_pub.contains_key(mono_sha) {
                 exported_mono_to_pub.insert(mono_sha.clone(), pub_sha.clone());
                 exported_mono_order.push(mono_sha.clone());
@@ -437,11 +534,13 @@ pub fn load_sync_view(
         let Some(values) = source_by_pub.get(pub_sha) else {
             continue;
         };
-        for mono_sha in values {
+        for source in values {
+            let mono_sha = &source.mono_sha;
             if missing.contains(mono_sha) {
                 let dead = BrokenSourceRef {
                     pub_sha: pub_sha.clone(),
                     mono_sha: mono_sha.clone(),
+                    id: source.id.clone(),
                 };
                 if last_exported_mono.is_some() {
                     superseded_source_refs.push(dead);
@@ -484,6 +583,9 @@ pub fn load_sync_view(
         broken_source_refs,
         superseded_source_refs,
         related,
+        foreign_sources: sources.foreign,
+        foreign_legacy_sources: sources.foreign_legacy,
+        legacy_assumed_shallow: sources.legacy_assumed_shallow,
     })
 }
 
@@ -611,6 +713,13 @@ mod tests {
             let mut s = subrepo(None);
             s.remote = self.remote_url();
             s
+        }
+
+        fn subrepo_with_id(&self, id: &str) -> ResolvedSubrepo {
+            ResolvedSubrepo {
+                monorepo_id: Some(id.to_string()),
+                ..self.subrepo()
+            }
         }
 
         fn next_date(&self) -> u64 {
@@ -791,6 +900,9 @@ mod tests {
         assert_eq!(view.export_base, None);
     }
 
+    /// Only a trailer tagged with this monorepo's own id can be broken: an untagged one that
+    /// resolves nowhere is another monorepo's (see the foreign tests below), but one carrying
+    /// our id is ours by declaration, so a sha we lack means the mapping really is unreadable.
     #[test]
     fn a_pub_commit_naming_an_unknown_mono_sha_is_a_broken_source_ref() {
         let f = Fixture::new("broken-source");
@@ -799,19 +911,100 @@ mod tests {
         let pub_sha = f.push_pub(
             &tree,
             None,
-            &format!("export\n\nMonosplice-Source: {bogus}\n"),
+            &format!("export\n\nMonosplice-Source: {bogus} b\n"),
         );
 
-        let view = load_sync_view(f.root(), &f.subrepo(), &online()).expect("view");
+        let view = load_sync_view(f.root(), &f.subrepo_with_id("b"), &online()).expect("view");
         assert_eq!(view.broken_source_refs.len(), 1);
         assert_eq!(view.broken_source_refs[0].pub_sha, pub_sha);
         assert_eq!(view.broken_source_refs[0].mono_sha, bogus);
+        assert_eq!(view.broken_source_refs[0].id.as_deref(), Some("b"));
         // A broken claim never becomes the rewrite-detection cursor.
         assert_eq!(view.last_exported_mono, None);
         // ...and it still counts as "related": pub is talking about us.
         assert!(view.related);
         // Nothing resolves anywhere, so nothing supersedes it either.
         assert!(view.superseded_source_refs.is_empty());
+        assert_eq!(view.foreign_sources, 0);
+    }
+
+    #[test]
+    fn a_trailer_tagged_with_another_id_is_foreign_and_imported_like_any_public_commit() {
+        let f = Fixture::new("foreign-tagged");
+        let mono = f.sh("git rev-parse HEAD");
+        let tree = f.sh("git rev-parse HEAD:core");
+        let mine = f.push_pub(
+            &tree,
+            None,
+            &format!("ours\n\nMonosplice-Source: {mono} b\n"),
+        );
+        let theirs = f.push_pub(
+            &tree,
+            Some(&mine),
+            &format!("theirs\n\nMonosplice-Source: {} a\n", "0".repeat(40)),
+        );
+
+        let view = load_sync_view(f.root(), &f.subrepo_with_id("b"), &online()).expect("view");
+        assert_eq!(
+            view.exported_mono_to_pub.get(&mono).map(String::as_str),
+            Some(mine.as_str())
+        );
+        assert_eq!(view.exported_mono_to_pub.len(), 1);
+        assert!(view.broken_source_refs.is_empty());
+        assert_eq!(view.unreflected_pub, vec![theirs]);
+        assert_eq!(view.foreign_sources, 1);
+        assert_eq!(view.foreign_legacy_sources, 0);
+    }
+
+    #[test]
+    fn foreign_trailers_alone_never_relate_the_two_repos() {
+        let f = Fixture::new("foreign-unrelated");
+        let tree = f.sh("git rev-parse HEAD:core");
+        let legacy = f.push_pub(
+            &tree,
+            None,
+            &format!("legacy\n\nMonosplice-Source: {}\n", "1".repeat(40)),
+        );
+        let tagged = f.push_pub(
+            &tree,
+            Some(&legacy),
+            &format!("tagged\n\nMonosplice-Source: {} a\n", "2".repeat(40)),
+        );
+
+        let view = load_sync_view(f.root(), &f.subrepo_with_id("b"), &online()).expect("view");
+        assert!(!view.related);
+        assert!(view.exported_mono_to_pub.is_empty());
+        assert!(view.broken_source_refs.is_empty());
+        assert_eq!(view.foreign_sources, 2);
+        assert_eq!(view.foreign_legacy_sources, 1);
+        assert_eq!(view.unreflected_pub, vec![legacy, tagged]);
+    }
+
+    #[test]
+    fn untagged_trailers_are_ours_as_a_group_when_any_is_an_ancestor_of_head() {
+        let f = Fixture::new("legacy-group");
+        let mono = f.sh("git rev-parse HEAD");
+        let tree = f.sh("git rev-parse HEAD:core");
+        let dead = f.push_pub(
+            &tree,
+            None,
+            &format!("rebased away\n\nMonosplice-Source: {}\n", "0".repeat(40)),
+        );
+        f.push_pub(
+            &tree,
+            Some(&dead),
+            &format!("live\n\nMonosplice-Source: {mono}\n"),
+        );
+
+        // Without an id, and with an id: legacy ownership is decided by ancestry either way.
+        for s in [f.subrepo(), f.subrepo_with_id("a")] {
+            let view = load_sync_view(f.root(), &s, &online()).expect("view");
+            assert_eq!(view.foreign_sources, 0);
+            assert_eq!(view.superseded_source_refs.len(), 1);
+            assert_eq!(view.superseded_source_refs[0].pub_sha, dead);
+            assert_eq!(view.export_base.as_deref(), Some(mono.as_str()));
+            assert!(!view.legacy_assumed_shallow);
+        }
     }
 
     /// Validation stops at the newest trailer that resolves. Below that point a dead sha is a

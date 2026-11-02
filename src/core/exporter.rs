@@ -18,7 +18,9 @@ use crate::core::sync_view::{
     fork_tracking_ref, load_fork_state, remote_tracking_ref, unpublished_view, SyncView,
     SyncViewOptions,
 };
-use crate::core::trailers::{append_trailer, get_trailer, ORIGIN_TRAILER, SOURCE_TRAILER};
+use crate::core::trailers::{
+    append_trailer, format_source, get_trailer, ORIGIN_TRAILER, SOURCE_TRAILER,
+};
 
 #[derive(Debug, Clone)]
 pub struct ExportCandidate {
@@ -462,9 +464,16 @@ pub fn check_export_preconditions(
     view: &SyncView,
 ) -> Option<String> {
     if let Some(broken) = view.broken_source_refs.first() {
+        let collision = match &broken.id {
+            Some(id) => format!("If another monorepo also has `id = \"{id}\"`, the ids collide: give each monorepo its own id.\n"),
+            None => String::new(),
+        };
         return Some(format!(
-            "{}: standalone commit {} carries {SOURCE_TRAILER}: {}, but that monorepo commit does not exist in this clone.\nThe commit mapping is broken, so monosplice cannot tell what is already published and will not export on top of it. Nothing was pushed to {}.\nRun `monosplice doctor` to see the full picture.",
-            subrepo.name, broken.pub_sha, broken.mono_sha, subrepo.remote,
+            "{}: standalone commit {} carries {SOURCE_TRAILER}: {}, but that monorepo commit does not exist in this clone.\nThe commit mapping is broken, so monosplice cannot tell what is already published and will not export on top of it. Nothing was pushed to {}.\n{collision}Run `monosplice doctor` to see the full picture.",
+            subrepo.name,
+            broken.pub_sha,
+            format_source(&broken.mono_sha, broken.id.as_deref()),
+            subrepo.remote,
         ));
     }
 
@@ -890,14 +899,19 @@ mod tests {
 
     // --- rewrite detection & preconditions ---
 
+    /// Only a trailer tagged with our own id can be broken (an untagged one nothing here
+    /// resolves is another monorepo's), so the refusal names the id and the likely cause.
     #[test]
     fn a_broken_source_ref_refuses_the_export_with_the_ts_wording() {
         let f = Fixture::new("broken-precondition");
-        let s = f.subrepo();
+        let s = ResolvedSubrepo {
+            monorepo_id: Some("b".to_string()),
+            ..f.subrepo()
+        };
         let tree = f.sh("git rev-parse HEAD:core");
         let bogus = "0".repeat(40);
         let pub_sha = f.sh(&format!(
-            "printf 'export\n\nMonosplice-Source: {bogus}\n' | git commit-tree {tree} "
+            "printf 'export\n\nMonosplice-Source: {bogus} b\n' | git commit-tree {tree} "
         ));
         f.sh(&format!(
             "git push -q {} {pub_sha}:refs/heads/main",
@@ -909,7 +923,7 @@ mod tests {
         assert_eq!(
             message,
             format!(
-                "core: standalone commit {pub_sha} carries Monosplice-Source: {bogus}, but that monorepo commit does not exist in this clone.\nThe commit mapping is broken, so monosplice cannot tell what is already published and will not export on top of it. Nothing was pushed to {}.\nRun `monosplice doctor` to see the full picture.",
+                "core: standalone commit {pub_sha} carries Monosplice-Source: {bogus} b, but that monorepo commit does not exist in this clone.\nThe commit mapping is broken, so monosplice cannot tell what is already published and will not export on top of it. Nothing was pushed to {}.\nIf another monorepo also has `id = \"b\"`, the ids collide: give each monorepo its own id.\nRun `monosplice doctor` to see the full picture.",
                 f.remote_url()
             )
         );
