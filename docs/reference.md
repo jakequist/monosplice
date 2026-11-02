@@ -299,7 +299,7 @@ Each run classifies the trailers on the standalone branch:
 | --- | --- |
 | tagged with this monorepo's `id` | ours |
 | tagged with another `id` | another monorepo's |
-| untagged (legacy) | judged as one group per subrepo: ours if any of them names a commit this clone has (on `HEAD`'s history or another branch), another monorepo's otherwise |
+| untagged (legacy) | judged as one group per subrepo: ours if any of them names a commit reachable from `HEAD` or a local branch, another monorepo's otherwise (a fetched remote or a stray object does not count; with an `id`, `doctor` notes when only a branch other than `HEAD`'s history makes them ours) |
 
 Only our own trailers decide what is already published, what counts as a broken mapping, and
 what `pull` skips. Another monorepo's exports are ordinary standalone commits here: `attach
@@ -333,7 +333,23 @@ The rules that keep two publishers apart:
   commits after them without their changes. When a foreign commit on the standalone branch's
   first-parent line sits between two sync points with no import of its own, every command
   refuses, names the commit, and prints the by-hand import that brings it in (a
-  `git diff | git apply --3way` and a commit carrying `Monosplice-Origin: <sha>`).
+  `git diff | git apply --3way` and a commit carrying `Monosplice-Origin: <sha>`). That import
+  lands above the 1.0 imports and any local commits, so `push` then asks for the imports first
+  (below). Either way, if the 1.0 imports are not shared yet, the cleaner route is to reset to
+  the commit before them and `monosplice pull` again on 1.1: every import is then made
+  properly, and nothing republishes a temporary deletion. Exporting on top of the by-hand
+  import without that, as 1.0's export order would, publishes the other monorepo's file deleted
+  for a commit and then restored.
+- **Imports go below your own work.** With two publishers, pull before you commit. When local
+  commits under the subrepo sit below an import of another monorepo's export, `push` and
+  `push --dry-run` refuse: exporting them first would publish trees without the imported
+  change, then the import again, and the other monorepo would pull that back — the two would
+  echo each other indefinitely. The refusal lists the commits and prints a sequence that puts
+  the imports first: branch the work, `git reset --hard` to the last export anchor,
+  `monosplice pull`, `git rebase --onto HEAD <anchor> <branch>` (the old imports drop out as
+  already applied), then push. It rewrites the branch from the anchor on, so do it before the
+  branch is shared. A conflicted import you resolved is not refused: its change differs from
+  the public commit's, and the resolution is exported as always.
 
 **Rollout is a hard precondition.** Every clone and CI runner that pulls or pushes the shared
 standalone repo — in every monorepo — must run monosplice 1.1.0 or later *before* the second
