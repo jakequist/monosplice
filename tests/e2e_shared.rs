@@ -653,7 +653,7 @@ fn a_reattach_by_snapshot_is_not_a_skipped_foreign_commit() {
 /// Shallow clones of A, once B has published: A's old exports are not in the clone, so they
 /// cannot be the sync point below a gap.
 #[test]
-fn shallow_clones_of_a_do_not_report_b_s_exports_as_skipped() {
+fn shallow_clones_of_a_refuse_once_b_has_published_and_agree_when_unshallowed() {
     let fx = shared_fixture();
     let b = fx.monorepo("mono-b", Some("b"), false);
     run_ok(&b.dir, &["attach", "core", &fx.pub_dir, "--import-history"]);
@@ -674,17 +674,36 @@ fn shallow_clones_of_a_do_not_report_b_s_exports_as_skipped() {
     fx.a.commit("a 5", &[("core/a5.txt", Some("5\n"))]);
     run_ok(&fx.a.dir, &["push"]);
 
-    // Only the guard is under test: a shallow clone holds none of A's import commits, so B's
-    // exports read as unimported there (as any outside commit does in a shallow clone).
+    // Multi-publisher bookkeeping needs full history: with another monorepo's trailers on the
+    // public branch, a shallow clone refuses and names the way out — and unshallowed, it agrees.
     for depth in [1, 3] {
         let clone = shallow_clone(&fx, &fx.a, depth, &format!("ad{depth}"));
-        let st = run_monosplice(&clone.dir, &["status"]);
-        assert_eq!(
-            st.exit_code, 0,
-            "depth {depth}: {}\n{}",
-            st.stdout, st.stderr
+        for args in [&["status"][..], &["pull"][..], &["push", "--dry-run"][..]] {
+            let res = run_monosplice(&clone.dir, args);
+            assert_ne!(res.exit_code, 0, "depth {depth} {args:?}: {}", res.stdout);
+            assert!(
+                res.stderr.contains("shallow clone")
+                    && res.stderr.contains("git fetch --unshallow")
+                    && !res.stderr.contains("never imported"),
+                "depth {depth} {args:?}: {}",
+                res.stderr
+            );
+        }
+        let doc = run_monosplice(&clone.dir, &["doctor"]);
+        assert_eq!(doc.exit_code, 1, "{}", doc.stdout);
+        assert!(
+            doc.stdout.contains("git fetch --unshallow"),
+            "{}",
+            doc.stdout
         );
-        assert!(!st.stderr.contains("never imported"), "{}", st.stderr);
+
+        clone.git(&["fetch", "-q", "--unshallow"]);
+        let st = run_ok(&clone.dir, &["status"]);
+        assert!(
+            st.stdout.contains("core: in sync"),
+            "depth {depth}: {}",
+            st.stdout
+        );
     }
 }
 

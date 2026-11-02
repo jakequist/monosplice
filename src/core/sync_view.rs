@@ -422,25 +422,21 @@ fn classify_sources(
             }
         }
     }
+    let shallow =
+        !parsed.is_empty() && git(root, &["rev-parse", "--is-shallow-repository"])? == "true";
     let mut legacy_off_head = false;
-    let (legacy_mine, legacy_assumed_shallow) = match legacy_group_is_mine(root, &legacy)? {
+    let (legacy_mine, legacy_assumed_shallow) = match legacy_group_is_mine(root, &legacy, shallow)?
+    {
         Legacy::Mine { on_head } => {
             legacy_off_head = !on_head;
             (true, false)
         }
         Legacy::Foreign => (false, false),
         // A monorepo with no id is the only kind that ever published untagged trailers, so it
-        // keeps 1.0's reading. One with an id may be any monorepo, and guessing "ours" would
-        // skip another monorepo's exports on pull and drop them on the next push.
+        // keeps 1.0's reading. One with an id cannot know: they count as foreign, and the
+        // shallow refusal below stops it before a guess can skip anything.
         Legacy::Undecidable if my_id.is_none() => (true, true),
-        Legacy::Undecidable => {
-            return Err(SyncViewError::Unsafe(format!(
-                "{}: this is a shallow clone, and none of the {} monorepo commit(s) named by untagged {SOURCE_TRAILER} trailers on {} is in it, so monosplice cannot tell whether they are this monorepo's exports or another monorepo's.\nNothing was changed. Run `git fetch --unshallow`, then run the command again.",
-                s.name,
-                legacy.len(),
-                pull_source(s),
-            )))
-        }
+        Legacy::Undecidable => (false, false),
     };
 
     let mut out = ClassifiedSources {
@@ -467,6 +463,17 @@ fn classify_sources(
             }
         }
     }
+    // Multi-publisher bookkeeping needs full history: which foreign commits were imported, and
+    // whose untagged trailers are whose, is decided by commits a shallow clone does not have.
+    // A single publisher with no foreign trailers keeps 1.0's behaviour.
+    if shallow && out.foreign > 0 {
+        return Err(SyncViewError::Unsafe(format!(
+            "{}: this is a shallow clone, and {} commit(s) on {} carry {SOURCE_TRAILER} trailers that are not this monorepo's (or cannot be told apart from another monorepo's here). Telling several publishers apart needs the full history, so monosplice will not guess.\nNothing was changed. Run `git fetch --unshallow`, then run the command again.",
+            s.name,
+            out.foreign,
+            pull_source(s),
+        )));
+    }
     Ok(out)
 }
 
@@ -481,7 +488,7 @@ enum Legacy {
     Undecidable,
 }
 
-fn legacy_group_is_mine(root: &Path, legacy: &[String]) -> Result<Legacy, GitError> {
+fn legacy_group_is_mine(root: &Path, legacy: &[String], shallow: bool) -> Result<Legacy, GitError> {
     if legacy.is_empty() || rev_parse(root, "HEAD").is_none() {
         return Ok(Legacy::Foreign);
     }
@@ -511,10 +518,11 @@ fn legacy_group_is_mine(root: &Path, legacy: &[String]) -> Result<Legacy, GitErr
             return Ok(Legacy::Mine { on_head: false });
         }
     }
-    if git(root, &["rev-parse", "--is-shallow-repository"])? == "true" {
-        return Ok(Legacy::Undecidable);
-    }
-    Ok(Legacy::Foreign)
+    Ok(if shallow {
+        Legacy::Undecidable
+    } else {
+        Legacy::Foreign
+    })
 }
 
 /// Foreign public commits an older monosplice skipped, oldest first.
