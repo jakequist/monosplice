@@ -19,9 +19,11 @@ brain and submodule-free ergonomics."
     says so.** Tagged with our id: ours. Tagged with another id: foreign. Untagged (legacy):
     one group per subrepo, ours when any of them names a commit reachable from HEAD or a local
     branch (`refs/heads/*`; a fetched remote or a stray object does not count), foreign
-    otherwise. A shallow clone holding none of them cannot
-    tell: with an `id` every command refuses (`git fetch --unshallow`); with none they stay ours
-    and `doctor` notes it. A foreign commit an older monosplice stepped over (no import of its
+    otherwise. Multi-publisher bookkeeping needs full history: a
+    shallow clone refuses every command (`git fetch --unshallow`) whenever pub carries a trailer
+    that is not ours, tagged or untagged (with an `id`, untagged ones it cannot decide count as
+    not ours). Without an `id` and with no foreign trailer, a shallow clone keeps 1.0's reading
+    of undecidable untagged trailers (ours), and `doctor` notes it. A foreign commit an older monosplice stepped over (no import of its
     own, between two sync points on pub's first-parent line, and the import above them does not
     reproduce its pub commit exactly; an export is a sync point only if its mono commit is
     here) makes every command refuse until it is imported by hand. Only our trailers

@@ -323,11 +323,14 @@ The rules that keep two publishers apart:
 - **Ids must be unique.** A trailer tagged with your own id that names a commit you do not have
   is a broken mapping, as before; `doctor` reports it with a `duplicate id?` hint, and `push`
   refuses.
-- **Shallow clones** may not hold the commits that decide. With an `id`, a shallow clone that
-  has none of the commits the untagged trailers name refuses every command and says to run
-  `git fetch --unshallow`: guessing "ours" would skip another monorepo's exports. Without an
-  `id` — only the first publisher ever wrote untagged trailers — they are counted as ours, as
-  before ids existed, and `doctor` notes the assumption.
+- **Shallow clones need full history once there are two publishers.** Which of the other
+  monorepo's exports were imported, and whose untagged trailers are whose, is decided by
+  commits a shallow clone does not have. So whenever the standalone branch carries a
+  `Monosplice-Source` trailer that is not this monorepo's — tagged or untagged, and with an
+  `id` that includes untagged ones the clone cannot place — every command refuses and says to
+  run `git fetch --unshallow`. A shallow clone of a single publisher (no `id`, no foreign
+  trailers) behaves exactly as before ids existed, and `doctor` notes when it assumed the
+  untagged trailers are its own.
 - **A foreign export an older monosplice skipped stops everything.** Before 1.1, `pull` read
   every Source trailer as its own, so it skipped another monorepo's exports and imported the
   commits after them without their changes. When a foreign commit on the standalone branch's
