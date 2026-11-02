@@ -553,21 +553,124 @@ fn a_foreign_export_an_older_monosplice_skipped_refuses_the_push() {
     let doc = run_monosplice(&fx.a.dir, &["doctor"]);
     assert_eq!(doc.exit_code, 1, "{}", doc.stdout);
 
-    // The recovery the message names: import the skipped commit by hand, then push.
-    let fix =
-        fx.a.git(&["diff", "--binary", &format!("{b_export}^"), &b_export]);
-    fx.a.git_with(
-        &["apply", "--index", "--3way", "--directory=core", "-"],
-        &[],
-        Some(&format!("{fix}\n")),
-    );
-    fx.a.commit(
-        &format!(
-            "Import {b_export} skipped by an older monosplice\n\nMonosplice-Origin: {b_export}"
-        ),
-        &[],
-    );
+    // The recovery the message names, run as printed: import the skipped commit by hand.
+    let refusal = run_monosplice(&fx.a.dir, &["push"]).stderr;
+    let ran = common::run_advice(&fx.a, &refusal);
+    assert_eq!(ran.len(), 2, "{ran:?}");
     let push = run_ok(&fx.a.dir, &["push"]);
     assert!(push.stdout.contains("exported"), "{}", push.stdout);
     assert_eq!(fx.pub_repo.file_at("HEAD", "fromb.txt"), "b");
+}
+
+// --- round 2 review: the skipped-foreign guard must not fire on healthy histories ---
+
+/// Clone a monorepo through the pack protocol with `--depth N`.
+fn shallow_clone(fx: &SharedFixture, from: &TestRepo, depth: u32, name: &str) -> TestRepo {
+    let dest = fx.sandbox.path().join(name);
+    from.git(&[
+        "clone",
+        "-q",
+        "--no-local",
+        "--depth",
+        &depth.to_string(),
+        &format!("file://{}", from.dir.display()),
+        &dest.display().to_string(),
+    ]);
+    TestRepo::new(dest)
+}
+
+fn assert_healthy(repo: &TestRepo, what: &str) {
+    for args in [&["status"][..], &["push", "--dry-run"][..]] {
+        let res = run_monosplice(&repo.dir, args);
+        assert_eq!(
+            res.exit_code, 0,
+            "{what}: {args:?}\n{}\n{}",
+            res.stdout, res.stderr
+        );
+    }
+}
+
+/// monosplice's own first-parent bypass: a side branch carrying a foreign export merges main in
+/// and main fast-forwards to it. The merge's import reproduces its public commit exactly, so the
+/// foreign commit came in with it.
+#[test]
+fn a_foreign_commit_carried_in_by_a_merge_import_is_not_skipped() {
+    let fx = shared_fixture();
+    let contrib = clone_remote(fx.sandbox.path(), &fx.pub_dir, "contrib");
+    contrib.commit("outside X", &[("X.txt", Some("X\n"))]);
+    contrib.git(&["push", "-q", "origin", "main"]);
+    run_ok(&fx.a.dir, &["pull"]);
+
+    contrib.git(&["checkout", "-q", "-b", "side", "HEAD~1"]);
+    contrib.commit(
+        &format!("b export\n\nMonosplice-Source: {} b", "e".repeat(40)),
+        &[("s1.txt", Some("s1\n"))],
+    );
+    contrib.merge("main", "merge main", &[]);
+    contrib.git(&["push", "-q", "origin", "side:main"]);
+
+    let pull = run_ok(&fx.a.dir, &["pull"]);
+    assert!(pull.stdout.contains("imported 1 commit"), "{}", pull.stdout);
+    assert_eq!(fx.a.read("core/s1.txt"), "s1\n");
+    assert_healthy(&fx.a, "after the merge import");
+}
+
+/// B detaches, removes the folder, and attaches again by snapshot: the snapshot reproduces the
+/// public head exactly, so every foreign commit below it came in with it.
+#[test]
+fn a_reattach_by_snapshot_is_not_a_skipped_foreign_commit() {
+    let fx = shared_fixture();
+    let b = fx.monorepo("mono-b", Some("b"), false);
+    run_ok(&b.dir, &["attach", "core", &fx.pub_dir, "--import-history"]);
+    b.commit("b feature", &[("core/fromb.txt", Some("b\n"))]);
+    run_ok(&b.dir, &["push"]);
+    fx.a.commit("a2", &[("core/a2.txt", Some("a\n"))]);
+    run_ok(&fx.a.dir, &["pull"]);
+    run_ok(&fx.a.dir, &["push"]);
+
+    run_ok(&b.dir, &["detach", "core"]);
+    fx.a.commit("a3", &[("core/a3.txt", Some("a\n"))]);
+    run_ok(&fx.a.dir, &["push"]);
+    b.git(&["rm", "-rq", "core"]);
+    b.commit("rm core", &[]);
+    run_ok(&b.dir, &["attach", "core", &fx.pub_dir]);
+    assert_healthy(&b, "after the re-attach");
+}
+
+/// Shallow clones of A, once B has published: A's old exports are not in the clone, so they
+/// cannot be the sync point below a gap.
+#[test]
+fn shallow_clones_of_a_do_not_report_b_s_exports_as_skipped() {
+    let fx = shared_fixture();
+    let b = fx.monorepo("mono-b", Some("b"), false);
+    run_ok(&b.dir, &["attach", "core", &fx.pub_dir, "--import-history"]);
+    b.commit("b feature", &[("core/fromb.txt", Some("b\n"))]);
+    run_ok(&b.dir, &["push"]);
+    run_ok(&fx.a.dir, &["pull"]);
+    for i in 1..=4 {
+        fx.a.commit(
+            &format!("a {i}"),
+            &[(&format!("core/a{i}.txt"), Some("a\n"))],
+        );
+    }
+    run_ok(&fx.a.dir, &["push"]);
+    run_ok(&b.dir, &["pull"]);
+    b.commit("b feature 2", &[("core/fromb2.txt", Some("b\n"))]);
+    run_ok(&b.dir, &["push"]);
+    run_ok(&fx.a.dir, &["pull"]);
+    fx.a.commit("a 5", &[("core/a5.txt", Some("5\n"))]);
+    run_ok(&fx.a.dir, &["push"]);
+
+    // Only the guard is under test: a shallow clone holds none of A's import commits, so B's
+    // exports read as unimported there (as any outside commit does in a shallow clone).
+    for depth in [1, 3] {
+        let clone = shallow_clone(&fx, &fx.a, depth, &format!("ad{depth}"));
+        let st = run_monosplice(&clone.dir, &["status"]);
+        assert_eq!(
+            st.exit_code, 0,
+            "depth {depth}: {}\n{}",
+            st.stdout, st.stderr
+        );
+        assert!(!st.stderr.contains("never imported"), "{}", st.stderr);
+    }
 }

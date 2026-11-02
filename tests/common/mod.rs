@@ -688,3 +688,42 @@ pub fn run_ok(dir: &Path, args: &[&str]) -> RunResult {
     );
     res
 }
+
+/// Run, in order, every command a monosplice message advises: each line indented by two spaces
+/// that starts with `git ` or `monosplice `, through `sh -c` in `repo` with the test git env.
+/// Panics when one fails. Returns the commands it ran.
+pub fn run_advice(repo: &TestRepo, message: &str) -> Vec<String> {
+    let bin = env!("CARGO_BIN_EXE_monosplice");
+    let mut ran = Vec::new();
+    for line in message.lines() {
+        let Some(cmd) = line.strip_prefix("  ") else {
+            continue;
+        };
+        let cmd = if let Some(rest) = cmd.strip_prefix("monosplice ") {
+            format!("{bin} {rest}")
+        } else if cmd.starts_with("git ") {
+            cmd.to_string()
+        } else {
+            continue;
+        };
+        let date = next_date();
+        let mut sh = Command::new("sh");
+        sh.arg("-c").arg(&cmd).current_dir(&repo.dir);
+        for (k, v) in git_env() {
+            sh.env(k, v);
+        }
+        sh.env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date);
+        let out = sh
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run `{cmd}`: {e}"));
+        assert!(
+            out.status.success(),
+            "advised command failed: {cmd}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        ran.push(cmd);
+    }
+    ran
+}

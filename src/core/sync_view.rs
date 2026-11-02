@@ -485,25 +485,49 @@ fn legacy_group_is_mine(root: &Path, legacy: &[String]) -> Result<Legacy, GitErr
 /// Before ids, every Source trailer read as "ours", so a 1.0 `pull` skipped another monorepo's
 /// export and imported the commit after it, diffed against the skipped one: its change never
 /// reached the monorepo. Ancestry now calls it reflected, and the next push would publish a tree
-/// without it. On the first-parent line below the last reflected commit, a foreign commit with
-/// no import of its own that sits *above* an earlier sync point (an import, or our own export)
-/// was stepped over. One below every sync point predates first contact and came in with the
-/// attach, so it is fine.
+/// without it.
+///
+/// On the first-parent line below the last reflected commit, a run of foreign commits with no
+/// import of their own, between two sync points, was stepped over — unless the import just above
+/// the run reproduces its public commit exactly (a snapshot attach, or the import of a merge
+/// that carried the run in): then the run's changes are in the monorepo. A sync point is an
+/// import (Origin) or one of our exports whose monorepo commit this clone has; a run below every
+/// sync point predates first contact and came in with the attach.
 fn find_skipped_foreign(
     root: &Path,
+    s: &ResolvedSubrepo,
     last_reflected: &str,
     foreign: &HashSet<String>,
-    imported: &HashSet<String>,
+    origin_by_mono: &HashMap<String, Vec<String>>,
     my_pubs: &HashSet<&String>,
 ) -> Result<Vec<String>, GitError> {
     if foreign.is_empty() {
         return Ok(Vec::new());
     }
+    let mut importers: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (mono, pubs) in origin_by_mono {
+        for pub_sha in pubs {
+            importers.entry(pub_sha).or_default().push(mono);
+        }
+    }
+    let reproduced = |pub_sha: &str| {
+        importers
+            .get(pub_sha)
+            .into_iter()
+            .flatten()
+            .any(|mono| reflects_exactly(root, s, mono, pub_sha))
+    };
+
     let mut skipped: Vec<String> = Vec::new();
     let mut pending: Vec<String> = Vec::new();
+    let mut above: Option<String> = None;
     for sha in rev_list(root, &["--first-parent", last_reflected])? {
-        if imported.contains(&sha) || my_pubs.contains(&sha) {
-            skipped.append(&mut pending);
+        if importers.contains_key(sha.as_str()) || my_pubs.contains(&sha) {
+            if !pending.is_empty() && !above.as_deref().is_some_and(reproduced) {
+                skipped.append(&mut pending);
+            }
+            pending.clear();
+            above = Some(sha);
         } else if foreign.contains(&sha) {
             pending.push(sha);
         }
@@ -517,7 +541,7 @@ fn skipped_foreign_message(s: &ResolvedSubrepo, skipped: &[String]) -> String {
         .iter()
         .map(|sha| {
             format!(
-                "  git diff --binary {sha}^ {sha} | git apply --index --3way --directory={}\n  git commit -m \"Import {sha} skipped by an older monosplice\" -m \"{ORIGIN_TRAILER}: {sha}\"\n",
+                "  git diff --binary {sha}^ {sha} | git apply --index --3way --directory={}\n  git commit --allow-empty -m \"Import {sha} skipped by an older monosplice\" -m \"{ORIGIN_TRAILER}: {sha}\"\n",
                 s.path
             )
         })
@@ -648,12 +672,19 @@ pub fn load_sync_view(
 
     let last_reflected = find_last_reflected(root, &origin_by_mono, &pub_ancestors)?;
     if let Some(reflected) = &last_reflected {
-        let my_pubs: HashSet<&String> = exported_mono_to_pub.values().collect();
+        // An export counts as a sync point only when its monorepo commit is here: a shallow
+        // clone cannot vouch for what was reflected when an export it lacks was made.
+        let my_pubs: HashSet<&String> = exported_mono_to_pub
+            .iter()
+            .filter(|(mono, _)| !missing.contains(*mono))
+            .map(|(_, pub_sha)| pub_sha)
+            .collect();
         let skipped = find_skipped_foreign(
             root,
+            s,
             reflected,
             &sources.foreign_shas,
-            &imported_pub_shas,
+            &origin_by_mono,
             &my_pubs,
         )?;
         if !skipped.is_empty() {
